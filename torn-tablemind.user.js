@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         Torn TableMind
 // @namespace    torn-tablemind
-// @version      0.2.0
+// @version      0.3.0
 // @description  Hold'em advisor for the Torn poker table you are viewing: correct prices, per-opponent ranges, EV of every action, and your own results. Reads the page only; never plays for you.
-// @author       -
+// @author       abrahamdelosreyes17-oss
+// @homepageURL  https://github.com/abrahamdelosreyes17-oss/torn-poker-releases
 // @match        https://www.torn.com/page.php?sid=holdem*
 // @run-at       document-idle
 // @noframes
@@ -20,7 +21,8 @@
  *
  * Rules this script keeps (see CLAUDE.md):
  *   - It reads only the poker page you are actively viewing, and pauses when
- *     the tab is hidden, unfocused or idle.
+ *     the tab is hidden. Seated, it keeps going until 5 minutes pass without
+ *     an action of yours; watching, it needs focus and input in the last 60 s.
  *   - It never clicks, types into, or intercepts Torn's controls. It only notes
  *     the time of your own clicks and keys, to pause when you are idle.
  *   - It has no network access at all: no @connect, no requests, no API key.
@@ -30,7 +32,7 @@
 (function () {
     'use strict';
 
-    const TTM_BUILD_VERSION = '0.2.0';
+    const TTM_BUILD_VERSION = '0.3.0';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -110,7 +112,16 @@
                 if (!db.objectStoreNames.contains('decisions')) db.createObjectStore('decisions', { keyPath: 'id' });
                 if (!db.objectStoreNames.contains('players')) db.createObjectStore('players', { keyPath: 'key' });
             };
-            req.onsuccess = () => resolve(req.result);
+            req.onsuccess = () => {
+                const db = req.result;
+                /* Another Torn tab upgrading the schema: let go, reopen on next use. */
+                db.onversionchange = () => {
+                    db.close();
+                    dbPromise = null;
+                };
+                resolve(db);
+            };
+            req.onblocked = () => reject(new Error('Close the other Torn tabs to finish updating the hand history'));
             req.onerror = () => reject(req.error);
         });
         dbPromise.catch(() => {
@@ -199,21 +210,27 @@
 
     /* ===== src/core/gate.js ===== */
     /*
-     * Safety gate (spec §3, L14). Everything, including logging, pauses unless
-     * the poker page is visible, focused, the table is on screen, the off
-     * switch is off, and the player touched the page recently. Torn's rule is
-     * about a person actively viewing the page; this is how the script keeps it.
+     * Safety gate (spec §3, L14). Everything, including logging, pauses unless the poker page is
+     * visible, the table is on screen, the off switch is off, and the player is present:
+     *   watching  the window is focused and was touched in the last idleLimitMs (60 s default)
+     *   seated    (dealt in, not sitting out) the user is playing: focus is not required, and only
+     *             seatedIdleMs (5 min) without any click, key or action of theirs pauses it.
+     *             At a 9-seat table two minutes can pass between your own actions (user, 2026-09-27).
      */
 
-    function evaluateGate({ urlOk, visible, focused, tablePresent, killSwitch, lastInputAt, now, idleLimitMs }) {
+    const SEATED_IDLE_MS = 5 * 60e3;
+
+    function evaluateGate({ urlOk, visible, focused, tablePresent, killSwitch, lastInputAt, now, idleLimitMs, seated = false, seatedIdleMs = SEATED_IDLE_MS }) {
         const reasons = [];
         if (!urlOk) reasons.push('Not the poker page');
         if (!visible) reasons.push('Tab is hidden');
-        if (!focused) reasons.push('Window is not focused');
+        if (!focused && !seated) reasons.push('Window is not focused');
         if (!tablePresent) reasons.push('No table on screen');
         if (killSwitch) reasons.push('Turned off in Settings');
         if (lastInputAt === null) reasons.push("Click the table or press any key to start. TableMind only reads while you're using this page");
-        else if (now - lastInputAt > idleLimitMs) reasons.push(`Paused after ${Math.round(idleLimitMs / 1000)} s without input`);
+        else if (seated ? now - lastInputAt > seatedIdleMs : now - lastInputAt > idleLimitMs) {
+            reasons.push(seated ? `Paused: no action from you for ${Math.round(seatedIdleMs / 60e3)} minutes` : `Paused after ${Math.round(idleLimitMs / 1000)} s without input`);
+        }
         return { open: reasons.length === 0, reasons };
     }
 
@@ -416,7 +433,7 @@
         const a = String(actor).trim();
         const t = String(text).replace(/\s+/g, ' ').trim();
 
-        if (/^game$/i.test(a)) {
+        if (/^game$/i.test(a) && state) {
             const m = /^([0-9a-f]{6,})\s+started/i.exec(t);
             return m ? { kind: 'start', gameId: m[1] } : { kind: 'unknown', actor: a, text: t };
         }
@@ -761,13 +778,13 @@
         const last = acts[acts.length - 1];
         const boardAt = rec.board.slice(0, BOARD_AT_STREET[last.street]);
         if (boardAt.length === 5) return null;
-        const hands = {};
+        const hands = Object.create(null);
         for (const n of live) {
             const cards = n === heroName ? heroCards : rec.shown && rec.shown[n];
             if (!cards || cards.length !== 2) return null;
             hands[n] = cards;
         }
-        const totals = {};
+        const totals = Object.create(null);
         for (const s of rec.seats) totals[s.name] = 0;
         for (const p of rec.posts) totals[p.who] = (totals[p.who] || 0) + p.amount;
         for (const a of acts) totals[a.who] = (totals[a.who] || 0) + (a.added || 0);
@@ -2326,7 +2343,7 @@
 
             const logToCall = Math.max(0, hand.currentBet - heroP.street);
             /* The button is the check, the log is the exact figure: labels round to $0.1k once they reach $1k. */
-            const label = snap.toCallLabel ?? null;
+            const label = snap.units === 'bb' ? null : snap.toCallLabel ?? null;
             const agrees = label !== null && Math.abs(label - logToCall) <= (snap.toCallTol || 0) + 0.5;
             const toCall = label === null || agrees ? logToCall : label;
             const toCallSource = label === null ? 'the log' : agrees ? 'log, checked with Call button' : "Torn's Call button";
@@ -2361,7 +2378,8 @@
             }
             if (!opponents.length) return { blocked: ['No opponent left in the hand'] };
 
-            const occupied = snap.seats.filter((s) => !s.empty && s.name && hand.players.has(s.name)).map((s) => s.index);
+            /* Hero joins hand.players only after posting or acting: without this, preflop positions were "?" (review B1). */
+            const occupied = snap.seats.filter((s) => !s.empty && (s.self || (s.name && hand.players.has(s.name))) && s.index !== null && s.index !== undefined).map((s) => s.index);
             const sb = hand.posts.find((x) => x.blind === 'sb');
             const bbPost = hand.posts.find((x) => x.blind === 'bb');
             const idx = (name) => seatByName.get(name)?.index;
@@ -2408,6 +2426,7 @@
     const NAME = /^[\w.-]{1,32}$/;
     const isObj = (o) => !!o && typeof o === 'object' && !Array.isArray(o);
     const num = (x) => typeof x === 'number' && Number.isFinite(x);
+    const numOrNull = (x) => x === null || x === undefined || num(x);
     const BAD_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
     const nameOk = (n) => typeof n === 'string' && NAME.test(n) && !BAD_KEYS.has(n);
 
@@ -2428,12 +2447,26 @@
         }
         if (!Object.values(o.net).every(num)) return false;
         if (!Array.isArray(o.winners || []) || !isObj(o.flags || {})) return false;
+        const card = (c) => Number.isInteger(c) && c >= 0 && c < 52;
+        if (!o.board.every(card) || o.board.length > 5) return false;
+        if (o.heroCards !== null && o.heroCards !== undefined && !(Array.isArray(o.heroCards) && o.heroCards.every(card))) return false;
+        for (const c of Object.values(o.shown || {})) if (!Array.isArray(c) || !c.every(card)) return false;
+        if (!(o.posts || []).every((p) => isObj(p) && names.has(p.who) && num(p.amount))) return false;
+        if (!o.actions.every((a) => numOrNull(a.added) && numOrNull(a.toAmount) && numOrNull(a.stackBefore))) return false;
+        if (!(o.winners || []).every((w) => isObj(w) && names.has(w.who) && num(w.amount))) return false;
+        if (!(o.uncalled || []).every((u) => isObj(u) && names.has(u.who) && num(u.amount))) return false;
+        if (!numOrNull(o.t0) || !numOrNull(o.t1)) return false;
         if (o.hero !== null && o.hero !== undefined && !nameOk(o.hero)) return false;
         return true;
     }
 
+    const validAction = (a) => isObj(a) && typeof a.id === 'string' && num(a.ev) && numOrNull(a.to);
+
     function validDecision(o) {
-        return isObj(o) && typeof o.id === 'string' && o.id.length < 80 && isObj(o.advice) && isObj(o.advice.best);
+        if (!isObj(o) || typeof o.id !== 'string' || o.id.length >= 80 || !isObj(o.advice)) return false;
+        if (!validAction(o.advice.best) || !Array.isArray(o.advice.actions) || !o.advice.actions.every(validAction)) return false;
+        if (o.taken !== null && o.taken !== undefined && !(isObj(o.taken) && typeof o.taken.type === 'string' && numOrNull(o.taken.toAmount))) return false;
+        return numOrNull(o.bb) && (o.street === undefined || typeof o.street === 'string');
     }
 
     /* ===== src/core/results.js ===== */
@@ -2442,6 +2475,7 @@
      * 95% range, by stake, position and opponent, plus leaks from the decision
      * journal. Never judges a decision by how the hand ended.
      */
+
 
 
     const Z = 1.96;
@@ -2454,7 +2488,7 @@
         return { mean, sd: Math.sqrt(v) };
     }
 
-    const heroOf = (rec, heroNames) => (rec.hero && rec.net && rec.hero in rec.net ? rec.hero : Object.keys(rec.net || {}).find((n) => heroNames.has(n)));
+    const heroOf = (rec, heroNames) => (rec.hero && rec.net && Object.hasOwn(rec.net, rec.hero) ? rec.hero : Object.keys(rec.net || {}).find((n) => heroNames.has(n)));
 
     function summarize(hands, { heroNames = new Set(), decisions = [], typeOf = () => null } = {}) {
         const rows = [];
@@ -2466,7 +2500,7 @@
                 const bb = rec.table && rec.table.bb ? rec.table.bb : 0;
                 if (!bb || !Number.isFinite(rec.net[hero])) continue;
                 const net = rec.net[hero];
-                const ai = allInEv(rec, hero, rec.heroCards);
+                const ai = rec.aiev && rec.aiev.hero === hero ? rec.aiev.result : allInEv(rec, hero, rec.heroCards);
                 const seat = rec.seats.find((s) => s.name === hero);
                 rows.push({ rec, hero, bb, net, ev: ai ? ai.ev : net, allIn: !!ai, pos: seat ? seat.position : null, t: rec.t1 || rec.t0 || 0 });
             } catch {
@@ -2521,13 +2555,15 @@
             const weight = side.reduce((s, [, v]) => s + Math.abs(v), 0);
             for (const [name, v] of side) {
                 const share = weight ? Math.abs(v) / weight : 0;
-                const g = opp.get(name) || { name, hands: 0, net: 0, ev: 0 };
+                const g = opp.get(name) || { name, hands: 0, net: 0, ev: 0, netBb: 0, evBb: 0 };
                 g.net += r.net * share;
                 g.ev += r.ev * share;
+                g.netBb += (r.net * share) / r.bb;
+                g.evBb += (r.ev * share) / r.bb;
                 opp.set(name, g);
             }
             for (const [name] of others) {
-                const g = opp.get(name) || { name, hands: 0, net: 0, ev: 0 };
+                const g = opp.get(name) || { name, hands: 0, net: 0, ev: 0, netBb: 0, evBb: 0 };
                 g.hands++;
                 opp.set(name, g);
             }
@@ -2535,7 +2571,7 @@
         const byOpponent = [...opp.values()].filter((g) => g.hands >= 5).sort((x, y) => Math.abs(y.net) - Math.abs(x.net)).slice(0, 25)
             .map((g) => ({ ...g, type: typeOf(g.name) }));
 
-        decisions = decisions.filter((d) => d && d.advice && d.advice.best);
+        decisions = decisions.filter(validDecision);
         const followed = decisions.filter((d) => d.taken);
         const agree = followed.filter((d) => sameAction(d.advice.best, d.taken)).length;
         const leaks = leaksFrom(followed);
@@ -2581,8 +2617,13 @@
     function leaksFrom(decisions) {
         const m = new Map();
         for (const d of decisions) {
-            if (sameAction(d.advice.best, d.taken)) continue;
-            const took = pricedTaken(d);
+            let took;
+            try {
+                if (sameAction(d.advice.best, d.taken)) continue;
+                took = pricedTaken(d);
+            } catch {
+                continue;
+            }
             if (!took) continue;
             const cost = (d.advice.best.ev - took.ev) / (d.bb || 1);
             if (!(cost > 0)) continue;
@@ -2601,14 +2642,11 @@
      * classes, attributes and element rects. It never clicks, focuses, types into
      * or intercepts anything on Torn's page.
      *
-     * Confirmed on the live page 2026-09-27 (docs/torn-markup-2026-09-27.md):
-     * seats, stacks, state text, the table-level dealer marker, board aria
-     * label, total/round pot, per-seat bets, the log rows, the units toggle.
-     *
-     * PENDING CAPTURE (needs a seated table): the hero seat marker, face-up card
-     * markup for hero, and the action-button labels. Those paths try the known
-     * candidates (WWpokerHUD's notes) and return null when unsure, so the UI
-     * shows "?" instead of guessing.
+     * Confirmed on the live page 2026-09-27 (docs/torn-markup-2026-09-27.md), spectating and
+     * seated: seats, stacks, state text, the dealer marker, board aria label, total/round pot,
+     * per-seat bets, log rows, the units toggle, hero's seat (playerMeGateway), hero's cards, and
+     * the action and queue buttons. Still unconfirmed: what big-blind display mode changes.
+     * Anything unsure returns null, so the UI shows "?" instead of guessing.
      */
 
 
@@ -2693,6 +2731,12 @@
         return seats;
     }
 
+    /** Seated and playing: a self seat exists and is not sitting out. Read before the gate decides. */
+    function heroSeated(root) {
+        const self = qa(root, '[id^="player-"]').find((p) => /(^|\s)self/.test((p.className || '').replace(/_{1,3}[A-Za-z0-9-]+/g, '')));
+        return !!self && !/sitting out/i.test(text(self));
+    }
+
     function readDealer(root, seats) {
         const d = q(root, '[class*="dealer"]');
         if (!d) return null;
@@ -2728,11 +2772,19 @@
     }
 
     /** The units toggle reads "Showing dollars" or (presumably) "Showing big blinds". */
+    let unitsButton = null;
     function readUnits(doc = document) {
-        for (const b of qa(doc, 'button')) {
+        const known = unitsButton && unitsButton.isConnected && unitsButton.ownerDocument === doc ? [unitsButton] : null;
+        for (const b of known || qa(doc, 'button[aria-label^="Showing" i], button')) {
             const label = (b.getAttribute('aria-label') || b.textContent || '').trim();
-            if (/^showing dollars/i.test(label)) return 'dollars';
-            if (/^showing (big blinds|bb)/i.test(label)) return 'bb';
+            if (/^showing dollars/i.test(label)) {
+                unitsButton = b;
+                return 'dollars';
+            }
+            if (/^showing (big blinds|bb)/i.test(label)) {
+                unitsButton = b;
+                return 'bb';
+            }
         }
         return null;
     }
@@ -2764,10 +2816,28 @@
         return out;
     }
 
+    /**
+     * Where Torn's own controls are (action and queue buttons, size chips, the amount box): one rect
+     * around them, so our panel can stay out of the way. Reads rects only.
+     */
+    function readActionArea(root) {
+        let box = null;
+        for (const e of qa(root, 'button[class*="btn"], button[class*="option"], button[class*="controlBtn"], input[class*="input-money"]')) {
+            const r = e.getBoundingClientRect ? e.getBoundingClientRect() : null;
+            if (!r || !r.width || !r.height) continue;
+            box = box
+                ? { left: Math.min(box.left, r.left), top: Math.min(box.top, r.top), right: Math.max(box.right, r.right), bottom: Math.max(box.bottom, r.bottom) }
+                : { left: r.left, top: r.top, right: r.right, bottom: r.bottom };
+        }
+        return box;
+    }
+
     /** Log rows as { key, state, won, actor, text }; key has amounts blanked (a $/BB switch rewrites them). */
     function readLogRows(doc = document) {
         const list = q(doc, '[class*="messagesList"]') || q(doc, '[aria-label="Game log"]');
-        return qa(list, 'li').map((li) => {
+        /* Placeholders Torn swaps out ("X is thinking…", "Your turn…") are not log lines (live 2026-09-27). */
+        const placeholder = (li) => /is thinking|^\s*your turn/i.test(li.textContent || '');
+        return qa(list, 'li').filter((li) => !placeholder(li)).map((li) => {
             const cls = li.className || '';
             const actor = text(q(li, 'em'));
             const t = text(q(li, 'span'));
@@ -2847,14 +2917,27 @@
     function createLogDiff() {
         let prev = null;
         return {
-            /** First call primes (history is not parsed). Returns the rows added since the last call. */
+            /**
+             * First call primes: older history is not parsed, but the hand in progress is, from its
+             * "Game … started" row on. Otherwise sitting down (or resuming after a pause) mid-hand lost
+             * the blinds, and the advisor stayed blocked until the next hand (live report 2026-09-27).
+             * Returns the rows added since the last call.
+             */
             next(rows) {
                 const keys = rows.map((r) => r.key);
                 if (prev === null) {
                     prev = keys;
+                    for (let i = rows.length - 1; i >= 0; i--) {
+                        if (/^game$/i.test(rows[i].actor || '') && /\bstarted\b/i.test(rows[i].text || '')) return rows.slice(i);
+                    }
                     return [];
                 }
-                const start = newRowsStart(prev, keys);
+                let start = newRowsStart(prev, keys);
+                /*
+                 * Torn shows a placeholder last row ("X is thinking…", "Your turn…") and then replaces it.
+                 * If the overlap broke, retry without our last row or two before treating it all as new.
+                 */
+                for (let drop = 1; start === 0 && drop <= 2 && prev.length > drop; drop++) start = newRowsStart(prev.slice(0, -drop), keys);
                 prev = keys;
                 return rows.slice(start);
             },
@@ -2892,6 +2975,13 @@
     .panel { position: fixed; z-index: 99995; top: 90px; right: 16px; width: 340px; max-height: calc(100vh - 110px); display: flex; flex-direction: column;
       background: #262626; border: 1px solid #3a3a3a; border-radius: 10px; overflow: hidden; box-shadow: 0 10px 30px rgba(0,0,0,.45); pointer-events: auto; }
     .panel.wide { width: min(1040px, calc(100vw - 32px)); }
+    @media (max-width: 760px) { .panel:not(.wide) { width: min(340px, calc(100vw - 24px)); right: 12px; } }
+    .panel.passthru { pointer-events: none; }
+    .panel.passthru > :not(.ptitle):not(.passnote) { opacity: .3; }
+    .panel.passthru .ptitle { pointer-events: auto; }
+    .passnote { display: none; padding: 6px 12px; font-size: 12px; color: var(--amber); background: #2a2410; border-bottom: 1px solid var(--line); }
+    .panel.passthru .passnote { display: block; }
+    .preminder { padding: 6px 12px; font-size: 12px; color: var(--amber); border-bottom: 1px solid var(--line); }
     .ptitle { display: flex; align-items: center; gap: 6px; min-height: 38px; padding: 4px 8px 4px 12px; background: var(--title); border-bottom: 1px solid #3a3a3a; cursor: move; user-select: none; flex: 0 0 auto; }
     .ptitle h2 { margin: 0; font-size: 13px; color: #fff; flex: 1; letter-spacing: .3px; white-space: nowrap; }
     .ptitle h2 .suit { color: var(--green); margin-right: 6px; }
@@ -3101,6 +3191,9 @@
         return liveUrls[kind];
     }
 
+    /* Keyboard focus for our own controls only (tab lists): never a Torn element. The audit allows this one line. */
+    const focusOwn = (node) => !!node && !!node.closest && !!node.closest('.ttm') && (node.focus(), true);
+
     /* ===== src/ui/settings-view.js ===== */
     /*
      * Settings, laid out like ../trading mockup J: a menu down the left with each
@@ -3132,13 +3225,24 @@
         return el('div', { class: 'sfield' }, [el('div', { class: 'fl' }, [label, sub ? el('small', { text: sub }) : null]), el('div', {}, controls)]);
     }
 
-    function numberInput(id, value, onSave, width = 80) {
-        const input = el('input', { class: 'field-in num', id, type: 'text', value: String(value), inputmode: 'numeric', style: { width: width + 'px', textAlign: 'right' } });
-        input.addEventListener('change', () => onSave(Number(input.value)));
-        return input;
+    /*
+     * A number box that shows what was actually kept: the setting is clamped to [min, max] and a
+     * rejected value is replaced by the stored one with a short note (review U2).
+     */
+    function numberInput(id, value, onSave, width = 80, { min, max, label, read } = {}) {
+        const input = el('input', { class: 'field-in num', id, type: 'number', min: String(min), max: String(max), step: '1', value: String(value), 'aria-label': label, style: { width: width + 'px', textAlign: 'right' } });
+        const note = el('span', { class: 'dim', 'aria-live': 'polite' });
+        input.addEventListener('change', () => {
+            const typed = Number(input.value);
+            onSave(typed);
+            const kept = read ? read() : typed;
+            input.value = String(kept);
+            note.textContent = kept !== typed ? ` Kept within ${min}–${max}.` : '';
+        });
+        return el('span', {}, [input, note]);
     }
 
-    function buildSettingsView({ getSettings, setSettings, actions, version, tablesVersion }) {
+    function buildSettingsView({ getSettings, setSettings, actions, version, tablesVersion, onRefresh = () => {} }) {
         const s = getSettings();
         const set = (patch) => setSettings(patch);
         const info = actions.settingsInfo ? actions.settingsInfo() : {};
@@ -3150,7 +3254,7 @@
                 body: [
                     field('Your seat', "From Torn's own seat marker", el('p', { class: info.heroFound ? 'ok' : 'muted', text: info.heroFound ? `Found: seat ${info.heroSeat + 1}. Your player id is kept on this device only.` : 'Not found yet. Sit at a table; if it stays not found, set your name below.' })),
                     field('Username fallback', 'Only used if the marker is missing', (() => {
-                        const input = el('input', { class: 'field-in', id: 'ttm-user', type: 'text', value: s.username, placeholder: 'Your Torn name', style: { width: '220px' } });
+                        const input = el('input', { class: 'field-in', id: 'ttm-user', type: 'text', value: s.username, placeholder: 'Your Torn name', 'aria-label': 'Your Torn name (fallback)', style: { width: '220px' } });
                         const save = el('button', { class: 'btn', type: 'button', text: 'Save' });
                         save.addEventListener('click', () => set({ username: input.value.trim() }));
                         return el('div', { class: 'row' }, [input, save]);
@@ -3206,19 +3310,21 @@
                             if (r && r.url) out.appendChild(el('a', { href: r.url, download: r.name, text: `Download ${r.name} (${r.count} hands)` }));
                             else out.textContent = 'Nothing to export yet.';
                         });
-                        const file = el('input', { type: 'file', accept: '.jsonl,.json', id: 'ttm-import', style: { maxWidth: '220px' } });
+                        const file = el('input', { type: 'file', accept: '.jsonl,.json', id: 'ttm-import', 'aria-label': 'Import a hands file', style: { maxWidth: '220px' } });
                         const imp = el('span', { class: 'muted' });
                         file.addEventListener('change', async () => {
                             if (!file.files[0]) return;
-                            imp.textContent = 'Importing…';
+                            imp.textContent = `Importing ${file.files[0].name} (${Math.max(1, Math.round(file.files[0].size / 1024))} KB)…`;
                             const r = await actions.importHands(file.files[0]);
+                            file.value = '';
                             imp.textContent = r.ok ? `Imported ${r.added} new hands (${r.skipped} already stored${r.invalid ? `, ${r.invalid} lines not valid and skipped` : ''}).` : r.error;
+                            if (r.ok && r.added) setTimeout(onRefresh, 1500);
                         });
                         return el('div', {}, [el('div', { class: 'row' }, [exp, out]), el('div', { class: 'row', style: { marginTop: '8px' } }, [el('span', { class: 'dim', text: 'Import:' }), file, imp])]);
                     })(),
-                        el('div', { class: 'row', style: { marginTop: '8px' } }, [el('span', { class: 'dim', text: 'Remind me every' }), numberInput('ttm-every', s.exportEvery, (v) => set({ exportEvery: v })), el('span', { class: 'dim', text: 'hands' })])),
+                        el('div', { class: 'row', style: { marginTop: '8px' } }, [el('span', { class: 'dim', text: 'Remind me every' }), numberInput('ttm-every', s.exportEvery, (v) => set({ exportEvery: v }), 80, { min: 100, max: 5000, label: 'Remind me to export every so many hands', read: () => getSettings().exportEvery }), el('span', { class: 'dim', text: 'hands' })])),
                     field('Delete', null, (() => {
-                        const input = el('input', { class: 'field-in', id: 'ttm-del', type: 'text', placeholder: 'Type DELETE', style: { width: '140px' } });
+                        const input = el('input', { class: 'field-in', id: 'ttm-del', type: 'text', placeholder: 'Type DELETE', 'aria-label': 'Type DELETE to confirm deleting all hands', style: { width: '140px' } });
                         const btn = el('button', { class: 'btn bad', type: 'button', text: 'Delete all hand history' });
                         const msg = el('span', { class: 'muted' });
                         btn.addEventListener('click', async () => {
@@ -3226,8 +3332,9 @@
                                 msg.textContent = 'Type DELETE first.';
                                 return;
                             }
-                            await actions.deleteAll();
-                            msg.textContent = 'Deleted.';
+                            const r = await actions.deleteAll();
+                            msg.textContent = r && r.ok === false ? r.error : 'Deleted.';
+                            if (!r || r.ok !== false) setTimeout(onRefresh, 800);
                             input.value = '';
                         });
                         return el('div', { class: 'row' }, [input, btn, msg]);
@@ -3237,15 +3344,16 @@
             {
                 id: 'results', title: 'Results', status: `${s.sessionGapH} h sessions`, dot: 'on', lead: 'How the results page groups your play.',
                 body: [
-                    field('New session after', null, el('div', { class: 'row' }, [numberInput('ttm-gap', s.sessionGapH, (v) => set({ sessionGapH: v }), 60), el('span', { class: 'dim', text: 'hours away' })])),
+                    field('New session after', null, el('div', { class: 'row' }, [numberInput('ttm-gap', s.sessionGapH, (v) => set({ sessionGapH: v }), 60, { min: 1, max: 24, label: 'Hours away that start a new session', read: () => getSettings().sessionGapH }), el('span', { class: 'dim', text: 'hours away' })])),
                     field('Default view', null, seg(s.resultsUnit, [['$', '$'], ['bb', 'Big blinds']], (v) => set({ resultsUnit: v }))),
                 ],
             },
             {
-                id: 'safety', title: 'Safety and rules', status: `Pause after ${s.idleSec} s`, dot: s.killSwitch ? 'warn' : 'on',
+                id: 'safety', title: 'Safety and rules', status: `${s.idleSec} s idle`, dot: s.killSwitch ? 'warn' : 'on',
                 lead: 'The script reads only the table you are looking at, and never plays for you.',
                 body: [
-                    field('Pause when idle', 'No click or key on the page', el('div', { class: 'row' }, [el('span', { class: 'dim', text: 'after' }), numberInput('ttm-idle', s.idleSec, (v) => set({ idleSec: v }), 60), el('span', { class: 'dim', text: 'seconds (30–120)' })])),
+                    field('Pause when idle', 'When you are only watching a table', el('div', { class: 'row' }, [el('span', { class: 'dim', text: 'after' }), numberInput('ttm-idle', s.idleSec, (v) => set({ idleSec: v }), 60, { min: 30, max: 120, label: 'Seconds without input before pausing while watching', read: () => getSettings().idleSec }), el('span', { class: 'dim', text: 'seconds (30–120)' })])),
+                    field('While you play', 'Seated and dealt in', el('p', { class: 'muted', style: { marginTop: '0' }, text: "It keeps reading while the Torn tab is visible, even when you switch windows. It pauses after 5 minutes with no action from you, or as soon as the tab is hidden." })),
                     field('Off switch', null, check(s.killSwitch, 'Turn everything off on this device', (v) => set({ killSwitch: v }), 'ttm-kill')),
                     field('Never does', null, el('ul', { class: 'never' }, [
                         el('li', { text: 'Clicks, types or presses anything on Torn' }),
@@ -3342,11 +3450,17 @@
         ...rows,
     ])]);
     const td = (text, cls = '') => el('td', { class: cls, text });
+    /* Today's hands by time; older ones with the date too. */
+    const whenText = (t) => {
+        const d = new Date(t);
+        const time = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        return d.toDateString() === new Date().toDateString() ? time : `${d.toLocaleDateString([], { month: 'short', day: 'numeric' })} ${time}`;
+    };
 
     function buildResultsView({ getSettings, data }) {
         const wrap = el('div', { style: { display: 'flex', flexDirection: 'column', minHeight: '0', flex: '1 1 auto' } });
         const tabs = el('div', { class: 'tabs', role: 'tablist' });
-        const body = el('div', { class: 'rbody' });
+        const body = el('div', { class: 'rbody', role: 'tabpanel', id: 'ttm-rpanel' });
         wrap.append(tabs, body);
         if (!data) {
             body.appendChild(el('div', { class: 'empty', text: 'Loading your hands…' }));
@@ -3396,7 +3510,7 @@
             opp: () => R.byOpponent.length
                 ? table([['Player'], ['Hands', 1], ['You won', 1], ['You won (EV)', 1]], R.byOpponent.map((g) => el('tr', {}, [
                     el('td', {}, [g.name + ' ', g.type ? el('span', { class: 'pill ' + g.type.type, text: g.type.label }) : null]),
-                    td(String(g.hands), 'n'), td(signedMoney(g.net), 'n ' + (g.net >= 0 ? 'pos' : 'neg')), td(signedMoney(g.ev), 'n dim'),
+                    td(String(g.hands), 'n'), td(amount(g.net, g.netBb), 'n ' + (g.net >= 0 ? 'pos' : 'neg')), td(amount(g.ev, g.evBb), 'n dim'),
                 ])))
                 : el('div', { class: 'empty', text: 'Opponents appear after 5 hands together.' }),
             leaks: () => R.leaks.length
@@ -3410,7 +3524,7 @@
                     ? `No leaks yet. You followed the advice in ${Math.round((R.followed || 0) * 100)}% of ${R.decisions} decisions. Spots where going against it cost EV will show here, judged by EV, not by how the hand ended.`
                     : 'Leaks appear once decisions have been recorded.' }),
             hands: () => table([['Time'], ['You'], ['Board'], ['Net', 1], ['All-in EV', 1]], R.recent.map((h) => el('tr', {}, [
-                td(h.t ? new Date(h.t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '', 'dim'),
+                td(h.t ? whenText(h.t) : '', 'dim'),
                 el('td', {}, [h.cards ? cardsEl(h.cards) : el('span', { class: 'dim', text: '?' })]),
                 el('td', {}, [h.board && h.board.length ? cardsEl(h.board) : el('span', { class: 'dim', text: 'no flop' })]),
                 td(amount(h.net, h.net / h.bb), 'n ' + (h.net >= 0 ? 'pos' : 'neg')),
@@ -3419,13 +3533,23 @@
         };
         const names = [['over', 'Overview'], ['stakes', 'Stakes & seats'], ['opp', 'Opponents'], ['leaks', 'Leaks'], ['hands', 'Hands']];
         const show = (id) => {
-            for (const b of tabs.children) b.setAttribute('aria-selected', String(b.dataset.tab === id));
+            for (const b of tabs.children) {
+                b.setAttribute('aria-selected', String(b.dataset.tab === id));
+                b.tabIndex = b.dataset.tab === id ? 0 : -1;
+            }
             while (body.firstChild) body.removeChild(body.firstChild);
             body.appendChild(panels[id]());
         };
         for (const [id, label] of names) {
-            const b = el('button', { type: 'button', role: 'tab', 'data-tab': id, text: label, 'aria-selected': 'false' });
+            const b = el('button', { type: 'button', role: 'tab', 'data-tab': id, text: label, 'aria-selected': 'false', 'aria-controls': 'ttm-rpanel' });
             b.addEventListener('click', () => show(id));
+            b.addEventListener('keydown', (e) => {
+                if (e.key !== 'ArrowRight' && e.key !== 'ArrowLeft') return;
+                const all = [...tabs.children];
+                const next = all[(all.indexOf(b) + (e.key === 'ArrowRight' ? 1 : all.length - 1)) % all.length];
+                show(next.dataset.tab);
+                focusOwn(next);
+            });
             tabs.appendChild(b);
         }
         show('over');
@@ -3458,9 +3582,12 @@
                 await navigator.clipboard.writeText(text);
                 copyOut.textContent = 'Copied.';
             } catch {
-                copyOut.textContent = 'Copy is blocked here; select the text below instead.';
+                copyOut.textContent = 'Copy is blocked here: the report is shown below, select it and copy.';
+                reportBox.textContent = text;
+                reportBox.classList.remove('hidden');
             }
         });
+        const reportBox = el('pre', { class: 'log hidden', 'aria-label': 'Calibration report' });
         const refresh = el('button', { class: 'btn', type: 'button', text: 'Refresh' });
         refresh.addEventListener('click', () => actions.openCalibration());
 
@@ -3476,7 +3603,7 @@
                     ['Your cards', info.heroCards || '?'],
                     ['Dealer seat', info.dealer === null ? '?' : `seat ${info.dealer + 1}`],
                     ['Board', info.board || 'none'],
-                    ['Pot', info.pot === null ? '?' : info.pot],
+                    ['Pot', info.pot === null ? '?' : '$' + Number(info.pot).toLocaleString('en-US')],
                     ['Units', info.units || '?'],
                     ['Action labels', info.actions || 'none (not your turn, or not seated)'],
                     ['Log rows', info.logRows],
@@ -3485,6 +3612,7 @@
                 ]),
                 el('div', { class: 'row', style: { marginTop: '12px' } }, [snapBtn, snapOut]),
                 el('div', { class: 'row', style: { marginTop: '8px' } }, [copyBtn, refresh, copyOut]),
+                reportBox,
             ]),
             el('div', { class: 'ssec' }, [
                 el('h2', { text: 'Recent log lines' }),
@@ -3530,10 +3658,10 @@
         const quickBtn = el('button', { type: 'button', text: 'Quick', 'aria-pressed': 'false' });
         const learnBtn = el('button', { type: 'button', text: 'Learn', 'aria-pressed': 'true' });
         modeSeg.append(quickBtn, learnBtn);
-        const backBtn = el('button', { class: 'ibtn hidden', type: 'button', title: 'Back (Esc)', text: '←' });
-        const resultsBtn = el('button', { class: 'ibtn', type: 'button', title: 'Results', text: '▤' });
-        const settingsBtn = el('button', { class: 'ibtn', type: 'button', title: 'Settings', text: '⚙' });
-        const collapseBtn = el('button', { class: 'ibtn', type: 'button', title: 'Collapse', text: '▾', 'aria-expanded': 'true' });
+        const backBtn = el('button', { class: 'ibtn hidden', type: 'button', title: 'Back (Esc)', 'aria-label': 'Back to the table', text: '←' });
+        const resultsBtn = el('button', { class: 'ibtn', type: 'button', title: 'Results', 'aria-label': 'Results', text: '▤' });
+        const settingsBtn = el('button', { class: 'ibtn', type: 'button', title: 'Settings', 'aria-label': 'Settings', text: '⚙' });
+        const collapseBtn = el('button', { class: 'ibtn', type: 'button', title: 'Collapse', 'aria-label': 'Collapse panel', text: '▾', 'aria-expanded': 'true' });
         title.append(backBtn, h2, cverdict, turnChip, modeSeg, resultsBtn, settingsBtn, collapseBtn);
         let heroTurn = false;
 
@@ -3544,7 +3672,11 @@
         const body = el('div', { class: 'pbody' });
         const foot = el('div', { class: 'pfoot' });
         const wide = el('div', { class: 'hidden', style: { display: 'flex', flexDirection: 'column', minHeight: '0', flex: '1 1 auto' } });
-        box.append(title, status, body, foot, wide);
+        /* Why the panel went see-through, and how to get it back (review U5). */
+        const passNote = el('div', { class: 'passnote', text: "Faded so Torn's buttons stay clickable. Drag this bar to move the panel, or collapse it." });
+        const reminder = el('div', { class: 'preminder hidden' });
+        box.append(title, passNote, status, reminder, body, foot, wide);
+        let clearKey = '';
         root.appendChild(box);
 
         let view = 'table';
@@ -3567,6 +3699,7 @@
             box.classList.toggle('collapsed', c && view === 'table');
             collapseBtn.textContent = c ? '▴' : '▾';
             collapseBtn.title = c ? 'Expand panel' : 'Collapse';
+            collapseBtn.setAttribute('aria-label', c ? 'Expand panel' : 'Collapse panel');
             collapseBtn.setAttribute('aria-expanded', String(!c));
         }
         collapseBtn.addEventListener('click', () => {
@@ -3607,6 +3740,7 @@
             const r = box.getBoundingClientRect();
             setSettings({ panelPos: { left: Math.round(r.left), top: Math.round(r.top) } });
         });
+        for (const type of ['pointercancel', 'lostpointercapture']) title.addEventListener(type, () => (drag = null));
 
         function show(next) {
             view = next;
@@ -3662,6 +3796,9 @@
                 body.appendChild(el('div', { class: 'waiting' }, reasons.length === 1
                     ? [el('p', { style: { margin: '0' }, text: reasons[0].replace(/([^.])$/, '$1.') })]
                     : [el('div', { class: 'lbl', text: 'Waiting' }), el('ul', {}, reasons.map((r) => el('li', { text: r })))]));
+                if (/^Click the table/.test(reasons[0] || '')) {
+                    body.appendChild(el('p', { class: 'dim', style: { margin: '10px 0 0', fontSize: '12px' }, text: '▤ Results and ⚙ Settings are in the title bar. Drag the title bar to move the panel.' }));
+                }
                 foot.textContent = `v${version} · tables v${tablesVersion}`;
                 return;
             }
@@ -3721,6 +3858,36 @@
 
         return {
             host: box,
+            /*
+             * Never cover Torn's buttons (live report 2026-09-27): end the panel above them, or, when there
+             * is no room, let clicks pass straight through it to Torn.
+             */
+            /*
+             * Never cover Torn's buttons in a clickable way (live report 2026-09-27; review B4/U1/U5):
+             *  - advice view: end above the buttons, or fade and let clicks through when there is no room;
+             *  - Results/Settings/Calibration keep their size, and on your turn also end above the buttons.
+             * The title bar always stays clickable. Re-measured only when something moved (review B8).
+             */
+            keepClear(area) {
+                const k = [area && [area.left, area.top, area.right, area.bottom].map(Math.round).join(','), view, heroTurn, box.style.left, box.style.top,
+                    window.innerWidth, window.innerHeight, body.childElementCount, getSettings().collapsed].join('|');
+                if (k === clearKey) return;
+                clearKey = k;
+                box.style.maxHeight = '';
+                box.classList.remove('passthru');
+                if (!area) return;
+                const r = box.getBoundingClientRect();
+                if (r.left >= area.right || r.right <= area.left || r.top >= area.bottom + 8 || r.bottom <= area.top - 8) return;
+                /* Wide views keep their size until it is your turn; then they end above the buttons too. */
+                if (view !== 'table' && !heroTurn) return;
+                const room = area.top - 8 - r.top;
+                if (room >= (view === 'table' ? 140 : 200)) box.style.maxHeight = room + 'px';
+                else box.classList.add('passthru');
+            },
+            setReminder(textOrNull) {
+                reminder.textContent = textOrNull || '';
+                reminder.classList.toggle('hidden', !textOrNull);
+            },
             setTurn(t) {
                 heroTurn = !!t;
                 turnChip.classList.toggle('hidden', view === 'table' || !heroTurn);
@@ -3788,14 +3955,38 @@
         /**
          * items: [{ key, rect, folded, hot, type: {type,label,hands,vpip,pfr}, conf, rangePct, read, note }]
          */
+        /* Where each tile goes: under its seat, inside the window, nudged down past a tile it would overlap (review U11). */
+        function place(items, settings) {
+            const out = new Map();
+            const taken = [];
+            for (const it of items) {
+                if (!it.rect || it.rect.width === 0) continue;
+                const w = it.hot && settings.tileHot ? 172 : 132;
+                const left = Math.max(4, Math.min(window.innerWidth - w - 4, it.rect.left + it.rect.width / 2 - w / 2));
+                let top = Math.min(window.innerHeight - 40, it.rect.bottom + 4);
+                for (const o of taken) if (left < o.left + o.w && left + w > o.left && Math.abs(top - o.top) < 44) top = o.top + 46;
+                taken.push({ left, top, w });
+                out.set(it.key, { left: Math.round(left), top: Math.round(top) });
+            }
+            return out;
+        }
+
         function update(items, settings) {
             const seen = new Set();
+            const spots = place(items, settings);
             if (settings.tiles) {
                 for (const it of items) {
                     if (!it.rect || it.rect.width === 0) continue;
                     if (it.folded && settings.folded === 'hide') continue;
                     seen.add(it.key);
                     const t = tileFor(it.key);
+                    const spot = spots.get(it.key);
+                    const pos = spot.left + ',' + spot.top;
+                    const sig = JSON.stringify([pos, it.folded, it.hot, it.type && [it.type.type, it.type.label, Math.round(it.type.vpip * 100), Math.round(it.type.pfr * 100), it.type.hands],
+                        Math.round((it.conf || 0) * 100), it.rangePct, it.read, it.note, it.noteDir,
+                        settings.tileType, settings.tileStats, settings.tileConf, settings.tileHot, settings.tileForm, settings.folded]);
+                    if (t.dataset.sig === sig) continue;
+                    t.dataset.sig = sig;
                     clear(t);
                     t.className = 'tile' + (it.hot && settings.tileHot ? ' hot' : '') + (it.folded && settings.folded === 'fade' ? ' faded' : '');
                     const top = el('div', { class: 't' }, [
@@ -3812,10 +4003,8 @@
                         if (it.read) t.appendChild(el('div', { class: 'rd', text: it.read }));
                     }
                     if (it.note && settings.tileForm) t.appendChild(el('div', { class: 'fm', text: it.note }));
-                    const w = it.hot && settings.tileHot ? 172 : 132;
-                    const cx = it.rect.left + it.rect.width / 2;
-                    t.style.left = Math.max(4, Math.min(window.innerWidth - w - 4, cx - w / 2)) + 'px';
-                    t.style.top = Math.min(window.innerHeight - 40, it.rect.bottom + 4) + 'px';
+                    t.style.left = spot.left + 'px';
+                    t.style.top = spot.top + 'px';
                 }
             }
             for (const [key, t] of tiles) {
@@ -3937,6 +4126,7 @@
 
 
 
+
     const TICK_MS = 700;
 
     function strongestRead(store, bb) {
@@ -3969,7 +4159,10 @@
         /* Keyed by player id or name, so no prototype: a name can never land on Object.prototype. */
         const players = Object.create(null);
         let handCount = 0;
-        let heroNames = new Set(gmGet('heroNames', []));
+        const counted = new Set();
+        let resultsCache = null;
+        const storedNames = gmGet('heroNames', []);
+        let heroNames = new Set(Array.isArray(storedNames) ? storedNames.filter((n) => typeof n === 'string') : []);
 
         const host = document.createElement('div');
         host.id = 'tablemind-host';
@@ -4018,8 +4211,13 @@
                 return { url: freshBlobUrl('export', blob), name: `tablemind-hands-${new Date().toISOString().slice(0, 10)}.jsonl`, count: hands.length };
             },
             async importHands(file) {
+                let text;
                 try {
-                    const text = await file.text();
+                    text = await file.text();
+                } catch (e) {
+                    return { ok: false, error: 'That file could not be read: ' + e.message };
+                }
+                try {
                     const have = new Set((await idbGetAll('hands')).map((h) => h.gameId));
                     const add = [];
                     const dec = [];
@@ -4049,13 +4247,22 @@
                     await actions.rebuildStats();
                     return { ok: true, added: add.length, skipped, invalid };
                 } catch (e) {
-                    return { ok: false, error: 'That file could not be read: ' + e.message };
+                    return { ok: false, error: 'The hands could not be saved in this browser: ' + e.message };
                 }
             },
             async deleteAll() {
-                await Promise.all([idbClear('hands'), idbClear('decisions'), idbClear('players')]).catch(() => {});
+                try {
+                    await Promise.all([idbClear('hands'), idbClear('decisions'), idbClear('players')]);
+                } catch (e) {
+                    return { ok: false, error: 'Nothing was deleted: ' + e.message };
+                }
                 for (const k of Object.keys(players)) delete players[k];
                 handCount = 0;
+                counted.clear();
+                pending = null;
+                resultsCache = null;
+                updateReminder();
+                return { ok: true };
             },
             async rebuildStats() {
                 const hands = await idbGetAll('hands');
@@ -4073,18 +4280,22 @@
                 }
                 await idbPutMany('players', Object.values(players));
                 handCount = hands.length;
+                resultsCache = null;
             },
             async loadResults() {
+                if (resultsCache && resultsCache.count === handCount) return resultsCache.data;
                 const hands = await idbGetAll('hands').catch(() => []);
                 const decisions = await idbGetAll('decisions').catch(() => []);
                 const byName = new Map(Object.values(players).map((p) => [p.name, p]));
                 const summary = summarize(hands, { heroNames, decisions, typeOf: (name) => (byName.get(name) ? archetype(byName.get(name)) : null) });
-                return { summary };
+                resultsCache = { count: handCount, data: { summary } };
+                return resultsCache.data;
             },
             settingsInfo() {
                 const pri = tables().priors.stats;
                 const fitted = Object.values(pri).filter((p) => p.source === 'fitted').length;
-                const last = gmGet('lastExport', null);
+                const saved = gmGet('lastExport', null);
+                const last = saved && Number.isFinite(saved.t) && Number.isFinite(saved.hands) ? saved : null;
                 return {
                     heroFound: !!(snap && snap.hero), heroSeat: snap && snap.hero ? snap.hero.index : null,
                     hands: handCount, priorsFitted: fitted, priorsBorrowed: Object.keys(pri).length - fitted,
@@ -4127,7 +4338,10 @@
             const cur = players[p.key];
             if (!cur || (p.hands || 0) > (cur.hands || 0)) players[p.key] = p;
         })).catch(() => {});
-        idbCount('hands').then((n) => (handCount = n)).catch(() => {});
+        idbCount('hands').then((n) => {
+            handCount = n;
+            updateReminder();
+        }).catch(() => {});
 
         function onHandComplete(rec) {
             const seated = !!rec.hero && rec.hero in (rec.net || {});
@@ -4136,16 +4350,36 @@
                 idbPut('decisions', pending).catch(() => {});
                 pending = null;
             }
+            /* A partial hand (joined mid-hand, log scrolled) cannot be settled: keep nothing (review B6). */
+            if (rec.flags.partial) return;
+            if (rec.hero && rec.heroCards) {
+                try {
+                    rec.aiev = { hero: rec.hero, result: allInEv(rec, rec.hero, rec.heroCards) };
+                } catch {
+                    /* Results computes it later instead */
+                }
+            }
             idbPut('hands', rec).catch(() => {});
+            resultsCache = null;
+            /* Resuming replays the hand on screen from its start: store it again, but count it once. */
+            if (counted.has(rec.gameId)) return;
+            counted.add(rec.gameId);
+            if (counted.size > 500) counted.delete(counted.values().next().value);
             handCount++;
             if (!rec.flags.partial && rec.flags.balanced) {
                 accumulate(players, rec);
                 const touched = rec.seats.map((s) => players[playerKey(s)]).filter(Boolean);
                 idbPutMany('players', touched).catch(() => {});
             }
-            if (settings.exportEvery && handCount % settings.exportEvery === 0) {
-                panel.setStatus(true, `${handCount} hands stored: export a backup in Settings › Hand history`, '');
-            }
+            updateReminder();
+        }
+
+        /* Shown until you export: hands since the last export reach the "remind me every" setting. */
+        function updateReminder() {
+            const saved = gmGet('lastExport', null);
+            const exported = saved && Number.isFinite(saved.hands) ? saved.hands : 0;
+            const due = settings.exportEvery && handCount - exported >= settings.exportEvery;
+            panel.setReminder(due ? `${(handCount - exported).toLocaleString('en-US')} hands since your last backup: export in Settings › Hand history` : null);
         }
 
         const markInput = (e) => {
@@ -4239,9 +4473,11 @@
             const now = Date.now();
             const root = findTableRoot();
             const wasOpen = gate.open;
+            const visible = document.visibilityState === 'visible';
             gate = evaluateGate({
-                urlOk: /sid=holdem/.test(location.search), visible: document.visibilityState === 'visible', focused: document.hasFocus(),
+                urlOk: /sid=holdem/.test(location.search), visible, focused: document.hasFocus(),
                 tablePresent: !!root, killSwitch: settings.killSwitch, lastInputAt, now, idleLimitMs: settings.idleSec * 1000,
+                seated: visible && !!root && heroSeated(root),
             });
             if (!gate.open) {
                 if (wasOpen) {
@@ -4270,6 +4506,8 @@
                 snap.hero.name = (mine && mine.actor) || settings.username || null;
             }
             for (const row of logdiff.next(rows)) {
+                /* A new action of your own at the table counts as being present. */
+                if (row.current) lastInputAt = Math.max(lastInputAt || 0, now);
                 const ev = parseLogRow(row);
                 recent.push(`${row.actor} | ${row.text}  →  ${ev.kind}${ev.type ? ':' + ev.type : ''}`);
                 if (recent.length > 60) recent.shift();
@@ -4294,9 +4532,10 @@
             resolvePending(hand, heroName);
 
             const bb = hand && hand.bb ? hand.bb : 0;
-            const tableText = bb ? `$${(bb / 2).toLocaleString('en-US')}/$${bb.toLocaleString('en-US')}` : '';
+            const tableText = bb && snap.units !== 'bb' && hand.unit !== 'bb' ? `$${(bb / 2).toLocaleString('en-US')}/$${bb.toLocaleString('en-US')}` : '';
             const turn = snap.heroTurn ? 'Your turn' : snap.hero ? 'Seated' : 'Watching';
             panel.setTurn(snap.heroTurn);
+            panel.keepClear(readActionArea(root));
             panel.setStatus(true, `${turn} · ${hand ? hand.street[0].toUpperCase() + hand.street.slice(1) : 'between hands'}`, tableText);
 
             const key = stateKey(hand, snap);
@@ -4329,7 +4568,9 @@
         window.addEventListener('resize', () => snap && updateTiles(snap, tracker.hand), { passive: true });
 
         gmMenu('TableMind: calibration', () => panel.show('calibration'));
-        gmMenu('TableMind: rebuild stats from hands', () => actions.rebuildStats());
+        gmMenu('TableMind: rebuild stats from hands', () => actions.rebuildStats()
+            .then(() => panel.setStatus(true, `Stats rebuilt from ${handCount.toLocaleString('en-US')} hands`, ''))
+            .catch((e) => panel.setStatus(false, 'Could not rebuild stats: ' + e.message, '')));
         gmMenu('TableMind: reset panel position', () => setSettings({ panelPos: null }));
     }
 

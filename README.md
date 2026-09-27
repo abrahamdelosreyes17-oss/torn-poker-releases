@@ -41,8 +41,9 @@ Then open `https://www.torn.com/page.php?sid=holdem` and click once on the page.
 
 ## Rules it keeps (Torn's terms)
 
-- It reads **only the poker page you are actively viewing**. It pauses when the tab is hidden, the window is
-  unfocused, or you haven't touched the page for 60 seconds.
+- It reads **only the poker page you are actively viewing**. A hidden tab always pauses it.
+  - **Seated and playing:** it keeps reading, even if you switch windows. It pauses after 5 minutes with no action from you.
+  - **Just watching a table:** it pauses when the window loses focus, or after 60 seconds without a click or key.
 - It **never clicks, types into, or intercepts** Torn's controls. It only notes the time of your own clicks and keys,
   so it can pause when you are idle.
 - **It never touches the network:** no API key, no requests, no `@connect`. Your hand history stays in your browser
@@ -58,9 +59,22 @@ Then open `https://www.torn.com/page.php?sid=holdem` and click once on the page.
 
 ## Version
 
+**0.3.0** fixes what the first live session showed:
+- **Advice mid-hand:** it now works after you sit down or come back to the window. Before, it waited for the next hand.
+- **Seated reading:** while you're seated and dealt in, it keeps reading when you switch windows. It pauses only when
+  the tab is hidden, or after 5 minutes with no action from you.
+- **Torn's buttons stay clickable.** The panel ends above them, or fades and lets clicks through, and its title bar
+  stays usable.
+- **Your position is known from the first decision of a hand.**
+- **Fixes:**
+  - a backup reminder that stays until you export
+  - faster Results
+  - clearer settings
+  - safer imports
+  - a stricter safety audit
+
 **0.2.0**:
 - reads the seated table
 - recency-weighted reads, with tilt notes for opponents and for you
 - fold odds that follow bet size
 - a bet-size tell
-- security and reliability fixes
