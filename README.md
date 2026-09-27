@@ -59,6 +59,21 @@ Then open `https://www.torn.com/page.php?sid=holdem` and click once on the page.
 
 ## Version
 
+**0.4.0** fixes the advice mistakes the first real-stakes session showed:
+- **No more bluff escalation into an all-in.** It no longer shoves weak hands into a player who just raised, and it
+  won't go all-in without real equity against the hands that call.
+- **Bluffs need evidence:** fold chances are estimated on the cautious side until the players show otherwise.
+- **Multiway pots are priced with everyone who might call,** not just one opponent.
+- **It learns the table:** reads lean on how this table has played before falling back to the general pool.
+- **"The money"** in Learn mode explains each decision in dollars: what you put in, how often they fold, what you
+  average when called.
+- **Results** show your poker profit in Torn dollars, including today.
+- **Fixes:**
+  - old advice no longer looks live
+  - no advice glitch right after you act
+  - the panel stays on screen at half-width (plus Reset panel position)
+  - the ` key collapses the panel
+
 **0.3.0** fixes what the first live session showed:
 - **Advice mid-hand:** it now works after you sit down or come back to the window. Before, it waited for the next hand.
 - **Seated reading:** while you're seated and dealt in, it keeps reading when you switch windows. It pauses only when
