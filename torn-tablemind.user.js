@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn TableMind
 // @namespace    torn-tablemind
-// @version      0.7.1
+// @version      0.7.2
 // @description  Hold'em advisor for the Torn poker table you are viewing: correct prices, per-opponent ranges, EV of every action, and your own results. Reads the page only; never plays for you.
 // @author       abrahamdelosreyes17-oss
 // @homepageURL  https://github.com/abrahamdelosreyes17-oss/torn-poker-releases
@@ -26,13 +26,14 @@
  *   - It never clicks, types into, or intercepts Torn's controls. It only notes
  *     the time of your own clicks and keys, to pause when you are idle.
  *   - It has no network access at all: no @connect, no requests, no API key.
- *   - Hand history stays in this browser until you export it yourself.
+ *   - Hand history stays on this computer: in this browser, and in the backup
+ *     folder you choose (if you choose one). It only writes its own .jsonl files.
  */
 
 (function () {
     'use strict';
 
-    const TTM_BUILD_VERSION = '0.7.1';
+    const TTM_BUILD_VERSION = '0.7.2';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -90,6 +91,7 @@
      *   hands      HandRecord by gameId
      *   decisions  DecisionRecord by id (gameId#i)
      *   players    stats store entries by key (derived: can be rebuilt from hands)
+     * and, in a second database, the backup folder's handle.
      * Clearing torn.com site data deletes this, which is why export exists.
      */
 
@@ -149,7 +151,603 @@
     const idbGetAll = (store) => run(store, 'readonly', (os) => os.getAll());
     const idbCount = (store) => run(store, 'readonly', (os) => os.count());
     const idbClear = (store) => run(store, 'readwrite', (os) => os.clear());
+    /** Several records in one transaction, as a Map key -> record (missing keys left out). */
+    const idbGetMany = (store, keys) => run(store, 'readonly', (os) => {
+        const out = new Map();
+        /* One bad key (a 0.7.0 journal entry with gameId null) must not fail the whole read. */
+        for (const k of keys.filter((x) => typeof x === 'string' || typeof x === 'number')) {
+            const r = os.get(k);
+            r.onsuccess = () => {
+                if (r.result !== undefined) out.set(k, r.result);
+            };
+        }
+        return out;
+    });
     const idbAvailable = () => open().then(() => true, () => false);
+
+    /*
+     * A separate small database for values JSON can't hold: the backup folder's handle (0.7.2). Kept
+     * apart so the hand database's version never changes for it, and an older build still opens that.
+     */
+    const KV_NAME = 'torn-tablemind-kv';
+    let kvPromise = null;
+
+    function openKv() {
+        if (kvPromise) return kvPromise;
+        kvPromise = new Promise((resolve, reject) => {
+            if (!globalThis.indexedDB) {
+                reject(new Error('IndexedDB is not available'));
+                return;
+            }
+            const req = indexedDB.open(KV_NAME, 1);
+            req.onupgradeneeded = () => {
+                if (!req.result.objectStoreNames.contains('kv')) req.result.createObjectStore('kv');
+            };
+            req.onsuccess = () => {
+                const db = req.result;
+                db.onversionchange = () => {
+                    db.close();
+                    kvPromise = null;
+                };
+                resolve(db);
+            };
+            req.onerror = () => reject(req.error);
+        });
+        kvPromise.catch(() => {
+            kvPromise = null;
+        });
+        return kvPromise;
+    }
+
+    function kvRun(mode, fn) {
+        return openKv().then(
+            (db) =>
+                new Promise((resolve, reject) => {
+                    const tx = db.transaction('kv', mode);
+                    const out = fn(tx.objectStore('kv'));
+                    tx.oncomplete = () => resolve(out && 'result' in out ? out.result : out);
+                    tx.onerror = () => reject(tx.error);
+                    tx.onabort = () => reject(tx.error);
+                }),
+        );
+    }
+
+    const kvGet = (key) => kvRun('readonly', (os) => os.get(key));
+    const kvSet = (key, value) => kvRun('readwrite', (os) => os.put(value, key));
+    const kvDelete = (key) => kvRun('readwrite', (os) => os.delete(key));
+
+    /* ===== src/core/backup.js ===== */
+    /*
+     * Automatic backup (0.7.2): finished hands and journaled decisions go to a folder the user picked
+     * once, one .jsonl file per day, so nothing depends on remembering Export or on the browser keeping
+     * torn.com's site data. Pure: the folder, the stores, the lock and the clock are passed in, so the
+     * write path runs under node with a fake folder.
+     *
+     * - Each day file is rewritten whole (read, merge by id, write), so a hand stored twice is one line,
+     *   and the browser swaps the new file in only when it is complete.
+     * - A decision leaves only once its hand is stored (settled), or when its hand never settled (the tab
+     *   closed mid-hand) and it is old: nothing about a live hand is written.
+     * - A full copy is owed after choosing a folder, after an import, and whenever the waiting list
+     *   overflows; the debt is kept across page loads and cleared only by a full copy that was written.
+     * Files use the export v2 format, so Settings › Import reads them back.
+     */
+
+    const FILE_NAME = /^tablemind-(\d{4}-\d{2}-\d{2}|full-\d{4}-\d{2}-\d{2}-\d{4})\.jsonl$/;
+    /* The only names the script ever writes; src/platform/fsa.js refuses anything else. */
+    const validBackupName = (n) => typeof n === 'string' && FILE_NAME.test(n);
+
+    const pad = (n) => String(n).padStart(2, '0');
+    /** Local calendar day, so a session's file is the day the user played it. */
+    function dayOf(t) {
+        const d = new Date(t);
+        return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+    }
+    const dayFileName = (day) => `tablemind-${day}.jsonl`;
+    function fullFileName(t) {
+        const d = new Date(t);
+        return `tablemind-full-${dayOf(t)}-${pad(d.getHours())}${pad(d.getMinutes())}.jsonl`;
+    }
+
+    /* A time from a record can be anything an import allowed: outside 2020..tomorrow it files under today. */
+    const MIN_T = Date.UTC(2020, 0, 1);
+    const usableT = (t, now) => Number.isFinite(t) && t >= MIN_T && t <= now + 864e5;
+    const saneT = (t, now) => (usableT(t, now) ? t : now);
+    /* How long ago a record was made; a time that can't be right counts as long ago, so nothing waits on it forever. */
+    const ageOf = (t, now) => (usableT(t, now) ? now - t : Infinity);
+
+    const recKey = (kind, id) => (kind === 'decision' ? 'd:' : 'h:') + id;
+    const recId = (kind, r) => (kind === 'decision' ? r.id : r.gameId);
+    const lineOf = (kind, r) => JSON.stringify(kind === 'decision' ? { kind: 'decision', ...r } : r);
+
+    function exportLines(hands, decisions, meta) {
+        return [JSON.stringify(meta)].concat(hands.map((h) => lineOf('hand', h)), decisions.map((d) => lineOf('decision', d)));
+    }
+
+    /*
+     * Merge records into a day file. One line per id, the newest version wins; hands first in time
+     * order, then decisions. A line this version doesn't recognise (unparseable, or a record kind it
+     * doesn't know) is kept as it was, at the end: a backup never loses what a later build wrote.
+     */
+    function mergeDayFile(existingText, items, meta) {
+        const byKey = new Map();
+        const unknown = [];
+        for (const line of (existingText || '').split('\n')) {
+            if (!line.trim()) continue;
+            let o;
+            try {
+                o = JSON.parse(line);
+            } catch {
+                unknown.push(line);
+                continue;
+            }
+            if (o && o.kind === 'meta') continue;
+            if (o && o.kind === 'decision' && typeof o.id === 'string') byKey.set(recKey('decision', o.id), { kind: 'decision', t: o.t ?? 0, line });
+            else if (o && o.kind === undefined && typeof o.gameId === 'string') byKey.set(recKey('hand', o.gameId), { kind: 'hand', t: o.t0 ?? o.t1 ?? 0, line });
+            else unknown.push(line);
+        }
+        for (const { kind, rec } of items) {
+            byKey.set(recKey(kind, recId(kind, rec)), { kind, t: (kind === 'decision' ? rec.t : rec.t0 ?? rec.t1) ?? 0, line: lineOf(kind, rec) });
+        }
+        const all = [...byKey.values()];
+        const hands = all.filter((x) => x.kind === 'hand').sort((a, b) => a.t - b.t);
+        const decisions = all.filter((x) => x.kind === 'decision').sort((a, b) => a.t - b.t);
+        const head = JSON.stringify({ ...meta, hands: hands.length, decisions: decisions.length });
+        const text = [head, ...hands.map((x) => x.line), ...decisions.map((x) => x.line), ...unknown].join('\n') + '\n';
+        return { text, hands: hands.length, decisions: decisions.length };
+    }
+
+    /* A decision whose hand never settled (tab closed mid-hand, a partial hand) is written once it is this old. */
+    const SETTLE_MS = 30 * 60e3;
+    /* Waiting ids kept across page loads; past this the full copy covers everything instead. */
+    const PENDING_CAP = 2000;
+    const CHUNK = 500;
+
+    /**
+     * @param {object} o
+     * @param {object} o.fs        { supported(), pick(remember) -> folder, load() -> folder|null, forget() }
+     *                             folder: { name, permission(request), read(name), write(name, parts), keep(on) }
+     * @param {object} o.store     { get(kind, ids) -> Promise<Map id -> record>, all() -> Promise<{hands, decisions}> }
+     * @param {object} o.saved     { load() -> {h, d, full, wanted}, save(obj) }: shared by every Torn tab
+     * @param {Function} o.every   hands between writes
+     * @param {Function} o.remember keep the folder for the next page load
+     * @param {Function} [o.withLock] runs fn exclusively across Torn tabs
+     */
+    function createBackup({ fs, store, saved, every = () => 5, remember = () => true, withLock = (fn) => fn(), now = () => Date.now(), version = '', onChange = () => {} }) {
+        const queue = new Map();
+        const listeners = new Set([onChange]);
+        let folder = null;
+        let status = fs.supported() ? 'off' : 'unsupported';
+        let error = null;
+        let pickError = null;
+        let stopped = false;
+        let last = null;
+        let needFull = false;
+        let wanted = false;
+        let handsSince = 0;
+        let busy = null;
+        let gen = 0;
+        let fails = 0;
+        let retryAt = 0;
+        let epoch = 0;
+
+        const state = () => ({
+            status, folder: folder ? folder.name : null, error, pickError, stopped, last, full: needFull, remembered: !!remember(),
+            waiting: [...queue.keys()].filter((k) => k[0] === 'h').length, pending: queue.size,
+        });
+        const emit = () => {
+            const s = state();
+            for (const fn of listeners) fn(s);
+        };
+        const set = (s, err = null) => {
+            status = s;
+            error = err;
+            emit();
+        };
+        const writable = () => !!folder && (status === 'ready' || status === 'error' || status === 'missing');
+
+        /* Read, merge, write: another tab's waiting ids stay, ours are added, what we just wrote goes. */
+        function persist(written = null) {
+            const s = saved.load() || {};
+            const ids = { h: new Set(Array.isArray(s.h) ? s.h : []), d: new Set(Array.isArray(s.d) ? s.d : []) };
+            if (Array.isArray(written)) for (const k of written) ids[k[0]].delete(k.slice(2));
+            for (const k of queue.keys()) ids[k[0]].add(k.slice(2));
+            /* Another tab's debt stays until a full copy is written; ours is needFull. */
+            let full = needFull || (!!s.full && written !== 'full');
+            if (ids.h.size + ids.d.size > PENDING_CAP) {
+                ids.h.clear();
+                ids.d.clear();
+                full = true;
+                needFull = true;
+            }
+            /* Whether a folder is wanted, and which choice it was, belong to choose() and stop(): keep what is stored. */
+            saved.save({ h: [...ids.h], d: [...ids.d], full, wanted: s.wanted ?? wanted, epoch: s.epoch ?? epoch });
+        }
+
+        /* Another tab stopped the backup or chose a new folder: follow it before writing anything. */
+        async function followOtherTabs() {
+            const s = saved.load() || {};
+            if ((s.epoch ?? 0) === epoch) return true;
+            gen++;
+            epoch = s.epoch ?? 0;
+            wanted = !!s.wanted;
+            queue.clear();
+            folder = null;
+            if (wanted) {
+                try {
+                    folder = await fs.load();
+                } catch {
+                    folder = null;
+                }
+            }
+            if (!folder) set(wanted ? 'repick' : 'off');
+            else if (await checkPermission(false)) set('ready');
+            return false;
+        }
+
+        function failed(e) {
+            const n = e && e.name;
+            fails++;
+            retryAt = now() + Math.min(30 * 60e3, 30e3 * 2 ** Math.min(fails, 6));
+            if (n === 'NotFoundError') set('missing');
+            else if (n === 'NotAllowedError' || n === 'SecurityError') set('paused');
+            else set('error', (e && e.message) || String(e));
+        }
+
+        async function checkPermission(request) {
+            const p = await folder.permission(request);
+            if (p === 'granted') return true;
+            set(p === 'denied' ? 'denied' : 'paused');
+            return false;
+        }
+
+        /* The whole hand history in one file, written in parts. Decisions of hands that aren't settled wait in the queue. */
+        async function writeFull(f, g) {
+            const { hands, decisions } = await store.all();
+            if (g !== gen) return false;
+            const settled = new Set(hands.map((h) => h.gameId));
+            const t = now();
+            const ok = [];
+            for (const d of decisions) {
+                if (settled.has(d.gameId) || ageOf(d.t, t) > SETTLE_MS) ok.push(d);
+                else queue.set(recKey('decision', d.id), { kind: 'decision', id: d.id, rec: d });
+            }
+            const name = fullFileName(t);
+            function* parts() {
+                yield JSON.stringify({ kind: 'meta', format: 'torn-tablemind', v: 2, version, exported: t, backup: 'full', hands: hands.length, decisions: ok.length }) + '\n';
+                for (let i = 0; i < hands.length; i += CHUNK) yield hands.slice(i, i + CHUNK).map((h) => lineOf('hand', h) + '\n').join('');
+                for (let i = 0; i < ok.length; i += CHUNK) yield ok.slice(i, i + CHUNK).map((d) => lineOf('decision', d) + '\n').join('');
+            }
+            await f.write(name, parts());
+            if (g !== gen) return false;
+            last = { t, file: name, hands: hands.length };
+            return true;
+        }
+
+        /* One pass: the owed full copy, then every queued record that may leave. Returns whether anything was written. */
+        async function writePass(f, g) {
+            let wrote = false;
+            const written = [];
+            if (needFull) {
+                if (!(await writeFull(f, g))) return false;
+                needFull = false;
+                wrote = true;
+                persist('full');
+            }
+            const items = [...queue.entries()];
+            const missing = { hand: [], decision: [] };
+            for (const [, x] of items) if (!x.rec) missing[x.kind].push(x.id);
+            const loaded = {
+                hand: missing.hand.length ? await store.get('hand', missing.hand) : new Map(),
+                decision: missing.decision.length ? await store.get('decision', missing.decision) : new Map(),
+            };
+            const recs = [];
+            for (const [k, x] of items) {
+                const rec = x.rec || loaded[x.kind].get(x.id);
+                if (!rec) {
+                    /* Deleted from this browser since it was queued: nothing to write. */
+                    if (queue.get(k) === x) queue.delete(k);
+                    written.push(k);
+                    continue;
+                }
+                recs.push([k, x, rec]);
+            }
+            /* A decision's hand: queued with it, or already stored. Its day is the hand's day. */
+            const handT0 = new Map();
+            for (const [, x, rec] of recs) if (x.kind === 'hand') handT0.set(rec.gameId, rec.t0 ?? rec.t1);
+            const ask = [...new Set(recs.filter(([, x, r]) => x.kind === 'decision' && typeof r.gameId === 'string' && !handT0.has(r.gameId)).map(([, , r]) => r.gameId))];
+            if (ask.length) for (const [id, h] of await store.get('hand', ask)) handT0.set(id, h.t0 ?? h.t1);
+            const t = now();
+            const byDay = new Map();
+            for (const [k, x, rec] of recs) {
+                let when;
+                if (x.kind === 'hand') when = rec.t0 ?? rec.t1;
+                else if (handT0.has(rec.gameId)) when = handT0.get(rec.gameId);
+                else if (ageOf(rec.t, t) > SETTLE_MS) when = rec.t;
+                else continue;
+                const day = dayOf(saneT(when, t));
+                if (!byDay.has(day)) byDay.set(day, []);
+                byDay.get(day).push([k, x, rec]);
+            }
+            for (const [day, list] of [...byDay].sort()) {
+                const name = dayFileName(day);
+                const out = mergeDayFile(await f.read(name), list.map(([, x, rec]) => ({ kind: x.kind, rec })), {
+                    kind: 'meta', format: 'torn-tablemind', v: 2, version, exported: t, backup: 'day', day,
+                });
+                if (g !== gen) return wrote;
+                await f.write(name, out.text);
+                wrote = true;
+                /* Only what was written leaves the queue: a newer version stored meanwhile stays for the next write. */
+                for (const [k, x] of list) {
+                    if (queue.get(k) === x) queue.delete(k);
+                    written.push(k);
+                }
+                last = { t, file: name, hands: out.hands };
+            }
+            handsSince = 0;
+            persist(written);
+            return wrote;
+        }
+
+        /** Write what is waiting. Automatic calls respect the back-off after a failure; a click doesn't. */
+        function flush({ manual = false } = {}) {
+            if (!writable() || (!manual && now() < retryAt) || (!queue.size && !needFull)) return busy || Promise.resolve(state());
+            if (busy) return busy.then(() => flush({ manual }));
+            const g = gen;
+            const f = folder;
+            busy = withLock(async () => ((await followOtherTabs()) && g === gen ? writePass(f, g) : false)).then(
+                (wrote) => {
+                    if (g !== gen) return;
+                    fails = 0;
+                    retryAt = 0;
+                    if (wrote) set('ready');
+                    else emit();
+                },
+                (e) => {
+                    if (g !== gen) return;
+                    /* Another tab held the lock (a big full copy): not a failure, just try again shortly. */
+                    if (e && (e.name === 'TimeoutError' || e.name === 'AbortError')) retryAt = now() + 30e3;
+                    else failed(e);
+                },
+            ).then(() => {
+                busy = null;
+                return state();
+            });
+            return busy;
+        }
+
+        const api = {
+            state,
+            flush,
+            subscribe(fn) {
+                listeners.add(fn);
+                return () => listeners.delete(fn);
+            },
+
+            async init() {
+                if (status === 'unsupported') return state();
+                const s = saved.load() || {};
+                wanted = !!s.wanted;
+                needFull = !!s.full;
+                epoch = s.epoch ?? 0;
+                for (const [kind, list] of [['hand', s.h], ['decision', s.d]]) {
+                    for (const id of Array.isArray(list) ? list : []) if (typeof id === 'string') queue.set(recKey(kind, id), { kind, id, rec: null });
+                }
+                try {
+                    folder = await fs.load();
+                } catch {
+                    folder = null;
+                }
+                if (!folder) {
+                    queue.clear();
+                    set(wanted ? 'repick' : 'off');
+                    return state();
+                }
+                try {
+                    if (await checkPermission(false)) {
+                        set('ready');
+                        await flush();
+                    }
+                } catch (e) {
+                    failed(e);
+                }
+                return state();
+            },
+
+            /** A record was just stored in IndexedDB (or failed to be: the backup still has it). */
+            add(kind, rec) {
+                if (!folder || !rec) return;
+                const id = recId(kind, rec);
+                if (typeof id !== 'string') return;
+                queue.set(recKey(kind, id), { kind, id, rec });
+                if (queue.size > PENDING_CAP) {
+                    queue.clear();
+                    needFull = true;
+                }
+                persist();
+                if (kind === 'hand') handsSince++;
+                if (handsSince >= Math.max(1, every())) flush();
+                else emit();
+            },
+
+            /** Records added outside play (an import): the next write includes a full copy. */
+            owe() {
+                if (!folder) return;
+                needFull = true;
+                persist();
+                emit();
+            },
+
+            /** "Back up everything now". */
+            writeAll() {
+                if (!folder) return Promise.resolve(state());
+                needFull = true;
+                persist();
+                return api.retry();
+            },
+
+            /* From a click in Settings or the panel: Chrome opens the folder picker only for a user gesture. */
+            async choose() {
+                pickError = null;
+                let f;
+                try {
+                    f = await fs.pick(remember());
+                } catch (e) {
+                    if (e && e.name === 'AbortError') {
+                        emit();
+                        return state();
+                    }
+                    pickError = e && e.name === 'FolderNotEmpty'
+                        ? `That folder has other things in it (${e.strangers.join(', ')}). Choose a new, empty folder used only for these backups.`
+                        : 'Could not use that folder: ' + ((e && e.message) || String(e));
+                    emit();
+                    return state();
+                }
+                gen++;
+                folder = f;
+                stopped = false;
+                wanted = true;
+                needFull = true;
+                fails = 0;
+                retryAt = 0;
+                epoch = ((saved.load() || {}).epoch ?? 0) + 1;
+                saved.save({ ...(saved.load() || {}), wanted: true, epoch });
+                persist();
+                set('ready');
+                await flush({ manual: true });
+                return state();
+            },
+
+            /* From a click (panel or Settings): the one button for every "not writing" state. */
+            async retry() {
+                if (!folder) return state();
+                try {
+                    if (await checkPermission(status === 'paused' || status === 'denied')) {
+                        set('ready');
+                        await flush({ manual: true });
+                    }
+                } catch (e) {
+                    failed(e);
+                }
+                return state();
+            },
+
+            /** Remember (or forget) the folder for the next page load, when the setting changes. */
+            async keep(on) {
+                if (folder) await Promise.resolve(folder.keep(on)).catch(() => {});
+                emit();
+            },
+
+            async stop() {
+                gen++;
+                await Promise.resolve(fs.forget()).catch(() => {});
+                folder = null;
+                queue.clear();
+                needFull = false;
+                wanted = false;
+                pickError = null;
+                stopped = true;
+                epoch = ((saved.load() || {}).epoch ?? 0) + 1;
+                saved.save({ h: [], d: [], full: false, wanted: false, epoch });
+                set(fs.supported() ? 'off' : 'unsupported');
+                return state();
+            },
+        };
+        return api;
+    }
+
+    /* ===== src/platform/fsa.js ===== */
+    /*
+     * The only file that touches the File System Access API (0.7.2 auto-backup; the audit enforces it).
+     * The folder handle never leaves this file: the rest of the script gets a folder object with a few
+     * methods. Every file is opened in one place, fileHandle(), which checks the name first. Nothing here
+     * deletes, moves or opens subfolders, and nothing touches Torn's page or leaves the computer.
+     */
+
+
+
+    const RW = { mode: 'readwrite' };
+    const KEY = 'backupDir';
+
+    function checkName(name) {
+        if (!validBackupName(name)) throw new Error('Not a backup file name: ' + String(name).slice(0, 60));
+    }
+
+    async function fileHandle(dir, name, create) {
+        checkName(name);
+        return dir.getFileHandle(name, { create });
+    }
+
+    /** What the rest of the script sees of a folder. Exported for the node tests, which pass a fake handle. */
+    function wrapFolder(dir) {
+        return {
+            name: String(dir.name || ''),
+            /** 'granted', 'prompt' or 'denied'. Asking (request) needs the click it came from. */
+            async permission(request = false) {
+                let p = await dir.queryPermission(RW);
+                if (p !== 'granted' && request) p = await dir.requestPermission(RW);
+                return p;
+            },
+            /** A backup file's text, or null when it doesn't exist yet (a missing folder then fails the write). */
+            async read(name) {
+                let fh;
+                try {
+                    fh = await fileHandle(dir, name, false);
+                } catch (e) {
+                    if (e && e.name === 'NotFoundError') return null;
+                    throw e;
+                }
+                return (await fh.getFile()).text();
+            },
+            /* The browser writes to a temporary file and swaps it in on close: a half-written backup never replaces a good one. */
+            async write(name, parts) {
+                const fh = await fileHandle(dir, name, true);
+                const w = await fh.createWritable();
+                try {
+                    for (const part of typeof parts === 'string' ? [parts] : parts) await w.write(part);
+                    await w.close();
+                } catch (e) {
+                    await w.abort().catch(() => {});
+                    throw e;
+                }
+            },
+            /** Names in the folder that are not our backups: the folder must be used for nothing else. */
+            async strangers(max = 5) {
+                const out = [];
+                for await (const [name, h] of dir.entries()) {
+                    if (h.kind === 'file' && (validBackupName(name) || /^tablemind-[\w-]+\.jsonl\.crswap$/.test(name))) continue;
+                    out.push(h.kind === 'file' ? name : name + '\\');
+                    if (out.length >= max) break;
+                }
+                return out;
+            },
+            /** Keep the handle for the next page load (this site's storage), or forget it. */
+            keep: (on) => (on ? kvSet(KEY, dir) : kvDelete(KEY)),
+        };
+    }
+
+    const fsaSupported = () => typeof globalThis.showDirectoryPicker === 'function';
+
+    /*
+     * Needs the click it came from: Chrome opens the picker only for a user gesture. Read access first, to look inside;
+     * write access only for a folder that holds nothing else, so a refused folder never gets a write grant.
+     */
+    async function pickFolder(remember) {
+        const dir = await globalThis.showDirectoryPicker({ id: 'tablemind-backup', mode: 'read' });
+        const folder = wrapFolder(dir);
+        const strangers = await folder.strangers();
+        if (strangers.length) throw Object.assign(new Error('The folder is not empty'), { name: 'FolderNotEmpty', strangers });
+        if ((await folder.permission(true)) !== 'granted') throw Object.assign(new Error('Chrome did not allow writing to the folder'), { name: 'NotAllowedError' });
+        /* A handle that can't be stored (IndexedDB blocked, the harness's fake) still works for this page. */
+        await folder.keep(!!remember).catch(() => {});
+        return folder;
+    }
+
+    async function loadFolder() {
+        const dir = await kvGet(KEY);
+        return dir ? wrapFolder(dir) : null;
+    }
+
+    const forgetFolder = () => kvDelete(KEY);
 
     /* ===== src/core/settings.js ===== */
     /* Settings and their defaults (mockup D defaults, confirmed 2026-09-27). */
@@ -175,6 +773,10 @@
         recordSeated: true,
         recordWatched: true,
         exportEvery: 500,
+        /* Automatic backup: hands between writes to the chosen folder (it also writes when you stop). */
+        backupEvery: 5,
+        /* Keep the backup folder between visits (in torn.com's storage); off means choosing it once per visit. */
+        backupRemember: true,
         sessionGapH: 2,
         resultsUnit: '$',
         idleSec: 60,
@@ -184,7 +786,7 @@
         panelPos: null,
     });
 
-    const LIMITS = { samples: [2000, 25000], idleSec: [30, 120], exportEvery: [100, 5000], sessionGapH: [1, 24] };
+    const LIMITS = { samples: [2000, 25000], idleSec: [30, 120], exportEvery: [100, 5000], backupEvery: [1, 100], sessionGapH: [1, 24] };
     const CHOICES = { mode: ['quick', 'learn'], units: ['$', 'bb'], exploit: ['off', 'capped', 'full'], folded: ['fade', 'hide', 'show'], resultsUnit: ['$', 'bb'] };
 
     /** Merge stored values over the defaults, dropping anything out of range or of the wrong type. */
@@ -4153,6 +4755,7 @@
     .passnote { display: none; padding: 6px 12px; font-size: 12px; color: var(--amber); background: #2a2410; border-bottom: 1px solid var(--line); }
     .panel.passthru .passnote { display: block; }
     .preminder { padding: 6px 12px; font-size: 12px; color: var(--amber); border-bottom: 1px solid var(--line); }
+    .preminder .btn { height: 26px; padding: 0 10px; margin-left: 6px; font-size: 12px; color: #eee; }
     .ptitle { display: flex; align-items: center; gap: 6px; min-height: 38px; padding: 4px 8px 4px 12px; background: var(--title); border-bottom: 1px solid #3a3a3a; cursor: move; user-select: none; flex: 0 0 auto; }
     .ptitle h2 { margin: 0; font-size: 13px; color: #fff; flex: 1; letter-spacing: .3px; white-space: nowrap; }
     .ptitle h2 .suit { color: var(--green); margin-right: 6px; }
@@ -4423,10 +5026,90 @@
         return el('span', {}, [input, note]);
     }
 
+    const hhmm = (t) => new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+    /* The status line and the one or two buttons that matter, redrawn in place on every backup change. */
+    function backupBlock(actions, getSettings, set) {
+        const box = el('div');
+        const act = (fn) => async () => {
+            for (const b of box.querySelectorAll('button')) b.disabled = true;
+            render(await fn());
+        };
+        const btn = (text, fn, cls = 'btn') => {
+            const b = el('button', { class: cls, type: 'button', text });
+            b.addEventListener('click', act(fn));
+            return b;
+        };
+        const p = (cls, text) => el('p', { class: cls, style: { marginTop: '0' }, text });
+        const remember = () => check(getSettings().backupRemember, 'Remember the folder between visits', (v) => {
+            set({ backupRemember: v });
+            actions.backupKeep(v);
+        }, 'ttm-bkeep');
+        const tradeoff = () => el('p', { class: 'muted', text: 'Chrome gives the folder to torn.com, so other scripts on torn.com could use it too: that is why it must be a folder used for nothing else. When Chrome asks, "Allow this time" means one click to allow it again after a restart; "Allow on every visit" means none, but the access stays open.' });
+        function render(st) {
+            clear(box);
+            const waiting = st.waiting ? ` ${st.waiting.toLocaleString('en-US')} hands waiting.` : '';
+            if (st.status === 'unsupported') {
+                box.append(p('muted', "This browser can't write to a folder on your computer (Chrome or Edge on a desktop can). Use Export below instead."));
+                return;
+            }
+            if (st.status === 'off' || st.status === 'repick') {
+                box.append(
+                    p(st.status === 'repick' ? 'note-warn' : 'muted', st.status === 'repick'
+                        ? 'The folder is not remembered between visits: choose it again to keep backing up.'
+                        : "Make a new, empty folder for this only, for example D:\\torn\\poker\\data\\backup, and choose it here (not a OneDrive, Google Drive or Dropbox folder, and not the top of a drive). One full copy is written now, then new hands and your decisions as you play, one file per day. Nothing is sent anywhere."),
+                    el('div', { class: 'row' }, [btn('Choose folder…', actions.backupChoose, 'btn go')]),
+                    remember(),
+                );
+            } else if (st.status === 'ready') {
+                box.append(
+                    p('ok', `On · folder "${st.folder}"` + (st.last ? ` · saved ${hhmm(st.last.t)} to ${st.last.file}` : '') + (st.waiting ? ` · ${st.waiting} hands waiting` : '')),
+                    el('div', { class: 'row' }, [btn('Back up everything now', actions.backupAll), btn('Change folder…', actions.backupChoose), btn('Stop', actions.backupStop, 'btn bad')]),
+                    remember(), tradeoff(),
+                );
+            } else if (st.status === 'paused') {
+                box.append(
+                    p('note-warn', `Paused: Chrome needs you to allow the folder "${st.folder}" again (it asks after a restart).${waiting}`),
+                    el('div', { class: 'row' }, [btn('Allow folder', actions.backupRetry, 'btn go'), btn('Change folder…', actions.backupChoose), btn('Stop', actions.backupStop, 'btn bad')]),
+                    remember(), tradeoff(),
+                );
+            } else if (st.status === 'denied') {
+                box.append(
+                    p('note-warn', `Chrome refused the folder "${st.folder}".${waiting} Choose it (or another) again.`),
+                    el('div', { class: 'row' }, [btn('Choose folder…', actions.backupChoose, 'btn go'), btn('Stop', actions.backupStop, 'btn bad')]),
+                );
+            } else if (st.status === 'missing') {
+                box.append(
+                    p('note-warn', `The folder "${st.folder}" can't be found (moved, renamed or deleted).${waiting}`),
+                    el('div', { class: 'row' }, [btn('Choose folder…', actions.backupChoose, 'btn go'), btn('Stop', actions.backupStop, 'btn bad')]),
+                );
+            } else {
+                box.append(
+                    p('note-warn', `The last write failed: ${st.error}. It tries again after the next hands.${waiting}`),
+                    el('div', { class: 'row' }, [btn('Try now', actions.backupRetry, 'btn go'), btn('Change folder…', actions.backupChoose), btn('Stop', actions.backupStop, 'btn bad')]),
+                );
+            }
+            if (st.pickError) box.append(p('note-warn', st.pickError));
+            if (st.status === 'off' && st.stopped) box.append(p('muted', 'Stopped. To take the folder access back from torn.com completely: Chrome › Settings › Privacy and security › Site settings › File editing.'));
+        }
+        render(actions.backupState ? actions.backupState() : { status: 'unsupported' });
+        /* Live while Settings is open: a write finishing, Chrome asking again. Drops itself once the view is gone. */
+        if (actions.backupSubscribe) {
+            const off = actions.backupSubscribe((st) => {
+                if (!box.isConnected && box.dataset.mounted) off();
+                else if (box.isConnected) render(st);
+            });
+            setTimeout(() => (box.dataset.mounted = '1'), 0);
+        }
+        return box;
+    }
+
     function buildSettingsView({ getSettings, setSettings, actions, version, tablesVersion, onRefresh = () => {} }) {
         const s = getSettings();
         const set = (patch) => setSettings(patch);
         const info = actions.settingsInfo ? actions.settingsInfo() : {};
+        const bst = actions.backupState ? actions.backupState().status : 'unsupported';
+        const backupOn = bst !== 'off' && bst !== 'unsupported';
 
         const sections = [
             {
@@ -4482,14 +5165,17 @@
                 ],
             },
             {
-                id: 'data', title: 'Hand history', status: info.hands !== undefined ? `${info.hands.toLocaleString('en-US')} hands` : '…', dot: 'on',
-                lead: 'Everything stays in this browser until you export it.',
+                id: 'data', title: 'Hand history', status: (info.hands !== undefined ? `${info.hands.toLocaleString('en-US')} hands` : '…') + (backupOn ? ` · backup ${bst === 'ready' ? 'on' : 'paused'}` : ''),
+                dot: backupOn && bst !== 'ready' ? 'warn' : 'on',
+                lead: 'Everything stays on this computer: in this browser, and in the backup folder if you choose one.',
                 body: [
                     field('Record', null,
                         check(s.recordSeated, 'Hands at my table', (v) => set({ recordSeated: v }), 'ttm-rs'),
                         check(s.recordWatched, "Tables I watch, only while I'm looking at them", (v) => set({ recordWatched: v }), 'ttm-rw')),
                     field('Stored', 'In this browser', el('p', { class: 'ok', style: { marginTop: '0' }, text: info.storedText || 'Counting…' })),
-                    field('Backup', 'Clearing torn.com site data deletes history', (() => {
+                    field('Automatic backup', 'To a folder on this computer', backupBlock(actions, getSettings, set),
+                        el('div', { class: 'row', style: { marginTop: '8px' } }, [el('span', { class: 'dim', text: 'Save every' }), numberInput('ttm-bevery', s.backupEvery, (v) => set({ backupEvery: v }), 60, { min: 1, max: 100, label: 'Write to the backup folder every so many hands', read: () => getSettings().backupEvery }), el('span', { class: 'dim', text: 'hands, and when you stop' })])),
+                    field('Export', 'Clearing torn.com site data deletes history', (() => {
                         const exp = el('button', { class: 'btn go', type: 'button', text: 'Export .jsonl' });
                         const out = el('span', { class: 'muted' });
                         exp.addEventListener('click', async () => {
@@ -4499,19 +5185,22 @@
                             if (r && r.url) out.appendChild(el('a', { href: r.url, download: r.name, text: `Download ${r.name} (${r.count} hands)` }));
                             else out.textContent = 'Nothing to export yet.';
                         });
-                        const file = el('input', { type: 'file', accept: '.jsonl,.json', id: 'ttm-import', 'aria-label': 'Import a hands file', style: { maxWidth: '220px' } });
+                        /* Several files at once: restoring from the backup folder means one file per day. */
+                        const file = el('input', { type: 'file', accept: '.jsonl,.json', multiple: true, id: 'ttm-import', 'aria-label': 'Import hands files', style: { maxWidth: '220px' } });
                         const imp = el('span', { class: 'muted' });
                         file.addEventListener('change', async () => {
-                            if (!file.files[0]) return;
-                            imp.textContent = `Importing ${file.files[0].name} (${Math.max(1, Math.round(file.files[0].size / 1024))} KB)…`;
-                            const r = await actions.importHands(file.files[0]);
+                            const files = [...file.files];
+                            if (!files.length) return;
+                            const kb = Math.max(1, Math.round(files.reduce((a, f) => a + f.size, 0) / 1024));
+                            imp.textContent = `Importing ${files.length > 1 ? files.length + ' files' : files[0].name} (${kb} KB)…`;
+                            const r = await actions.importHands(files);
                             file.value = '';
                             imp.textContent = r.ok ? `Imported ${r.added} new hands (${r.skipped} already stored${r.invalid ? `, ${r.invalid} lines not valid and skipped` : ''}).` : r.error;
                             if (r.ok && r.added) setTimeout(onRefresh, 1500);
                         });
                         return el('div', {}, [el('div', { class: 'row' }, [exp, out]), el('div', { class: 'row', style: { marginTop: '8px' } }, [el('span', { class: 'dim', text: 'Import:' }), file, imp])]);
                     })(),
-                        el('div', { class: 'row', style: { marginTop: '8px' } }, [el('span', { class: 'dim', text: 'Remind me every' }), numberInput('ttm-every', s.exportEvery, (v) => set({ exportEvery: v }), 80, { min: 100, max: 5000, label: 'Remind me to export every so many hands', read: () => getSettings().exportEvery }), el('span', { class: 'dim', text: 'hands' })])),
+                        el('div', { class: 'row', style: { marginTop: '8px' } }, [el('span', { class: 'dim', text: 'Without automatic backup, remind me every' }), numberInput('ttm-every', s.exportEvery, (v) => set({ exportEvery: v }), 80, { min: 100, max: 5000, label: 'Remind me to export every so many hands', read: () => getSettings().exportEvery }), el('span', { class: 'dim', text: 'hands' })])),
                     field('Delete', null, (() => {
                         const input = el('input', { class: 'field-in', id: 'ttm-del', type: 'text', placeholder: 'Type DELETE', 'aria-label': 'Type DELETE to confirm deleting all hands', style: { width: '140px' } });
                         const btn = el('button', { class: 'btn bad', type: 'button', text: 'Delete all hand history' });
@@ -4547,6 +5236,7 @@
                     field('Never does', null, el('ul', { class: 'never' }, [
                         el('li', { text: 'Clicks, types or presses anything on Torn' }),
                         el('li', { text: 'Sends anything anywhere (it has no internet access at all)' }),
+                        el('li', { text: 'Writes any file except its own backups, in the folder you choose' }),
                         el('li', { text: 'Uses the Torn API or a key' }),
                         el('li', { text: "Runs in a background tab or while you're away" }),
                     ])),
@@ -5497,8 +6187,14 @@
                 if (room >= (view === 'table' ? 140 : 200)) box.style.maxHeight = room + 'px';
                 else box.classList.add('passthru');
             },
-            setReminder(textOrNull) {
+            /* action: { label, onClick } for the one click that fixes it (a backup folder to allow again). */
+            setReminder(textOrNull, action = null) {
                 reminder.textContent = textOrNull || '';
+                if (textOrNull && action) {
+                    const b = el('button', { class: 'btn', type: 'button', text: action.label });
+                    b.addEventListener('click', () => action.onClick());
+                    reminder.append(' ', b);
+                }
                 reminder.classList.toggle('hidden', !textOrNull);
             },
             setTurn(t) {
@@ -5889,6 +6585,8 @@
 
 
 
+
+
     const TICK_MS = 700;
     /* Bump when stats.js counts differently: stored players are rebuilt from the raw hands once (0.7: AFq with checks,
        shv/shvj per stake). */
@@ -5924,7 +6622,8 @@
         /* Keyed by player id or name, so no prototype: a name can never land on Object.prototype. */
         const players = Object.create(null);
         let handCount = 0;
-        const counted = new Set();
+        /* gameId -> when the hand started: a hand replayed on resume keeps its first start time. */
+        const counted = new Map();
         let resultsCache = null;
         const storedNames = gmGet('heroNames', []);
         let heroNames = new Set(Array.isArray(storedNames) ? storedNames.filter((n) => typeof n === 'string') : []);
@@ -5967,6 +6666,29 @@
         let turnFresh = false;
         const advisor = createAdvisor({ getPlayer: (k) => players[k] || null });
         const logdiff = createLogDiff();
+        let backupState = null;
+        const backup = createBackup({
+            fs: { supported: fsaSupported, pick: pickFolder, load: loadFolder, forget: forgetFolder },
+            store: {
+                get: (kind, ids) => idbGetMany(kind === 'hand' ? 'hands' : 'decisions', ids),
+                all: async () => ({ hands: await idbGetAll('hands'), decisions: await idbGetAll('decisions') }),
+            },
+            saved: { load: () => gmGet('backup', null), save: (o) => gmSet('backup', o) },
+            every: () => settings.backupEvery,
+            remember: () => settings.backupRemember,
+            /* Two Torn tabs must not rewrite the same day file at once; a lock held elsewhere times out as a failed write. */
+            withLock: (fn) => (globalThis.navigator && navigator.locks && typeof AbortSignal.timeout === 'function'
+                ? navigator.locks.request('tablemind-backup', { signal: AbortSignal.timeout(15000) }, fn) : fn()),
+            version,
+            onChange: (st) => {
+                backupState = st;
+                updateReminder();
+            },
+        });
+        /* The last hand store in flight: the pause flush waits for it. */
+        let lastStore = Promise.resolve();
+        /* Hero's decisions are part of "Hands at my table": off means none are kept or backed up. */
+        const storeDecision = (d) => (settings.recordSeated ? idbPut('decisions', d).catch(() => {}).then(() => backup.add('decision', d)) : Promise.resolve());
 
         function setSettings(patch) {
             settings = normalizeSettings({ ...settings, ...patch });
@@ -5983,47 +6705,66 @@
                 if (!hands.length) return null;
                 /* Export v2: a meta line first (import skips it; v1 files have none). */
                 const meta = { kind: 'meta', format: 'torn-tablemind', v: 2, version, exported: Date.now(), hands: hands.length, decisions: decisions.length };
-                const lines = [JSON.stringify(meta)].concat(hands.map((h) => JSON.stringify(h)), decisions.map((d) => JSON.stringify({ kind: 'decision', ...d })));
-                const blob = new Blob([lines.join('\n') + '\n'], { type: 'application/x-ndjson' });
+                const blob = new Blob([exportLines(hands, decisions, meta).join('\n') + '\n'], { type: 'application/x-ndjson' });
                 gmSet('lastExport', { t: Date.now(), hands: hands.length });
                 return { url: freshBlobUrl('export', blob), name: `tablemind-hands-${new Date().toISOString().slice(0, 10)}.jsonl`, count: hands.length };
             },
-            async importHands(file) {
-                let text;
-                try {
-                    text = await file.text();
-                } catch (e) {
-                    return { ok: false, error: 'That file could not be read: ' + e.message };
-                }
+            async importHands(fileOrFiles) {
+                const files = [].concat(fileOrFiles);
+                /* A backup folder can hold months of files: past this, import them a few at a time (SAST 2026-09-29). */
+                const total = files.reduce((a, f) => a + (f.size || 0), 0);
+                if (total > 200 * 1024 * 1024) return { ok: false, error: `That is ${Math.round(total / 1048576)} MB; import up to 200 MB at a time.` };
                 try {
                     const have = new Set((await idbGetAll('hands')).map((h) => h.gameId));
+                    /* A journal entry is replaced only by a newer copy of itself: day files and full copies overlap. */
+                    const decT = new Map((await idbGetAll('decisions')).map((d) => [d.id, d.t ?? 0]));
                     const add = [];
-                    const dec = [];
+                    const dec = new Map();
                     let skipped = 0;
                     let invalid = 0;
-                    for (const line of text.split('\n')) {
-                        if (!line.trim()) continue;
-                        let o;
+                    for (const file of files) {
+                        let text;
                         try {
-                            o = JSON.parse(line);
-                        } catch {
-                            invalid++;
-                            continue;
+                            text = await file.text();
+                        } catch (e) {
+                            return { ok: false, error: `${file.name || 'That file'} could not be read: ` + e.message };
                         }
-                        if (o && o.kind === 'meta') continue;
-                        if (o && o.kind === 'decision') {
-                            if (validDecision(o)) dec.push((({ kind, ...rest }) => rest)(o));
-                            else invalid++;
-                        } else if (validHandRecord(o)) {
-                            if (have.has(o.gameId)) skipped++;
-                            else add.push(o);
-                        } else {
-                            invalid++;
+                        for (const line of text.split('\n')) {
+                            if (!line.trim()) continue;
+                            if (line.length > 65536) {
+                                invalid++;
+                                continue;
+                            }
+                            let o;
+                            try {
+                                o = JSON.parse(line);
+                            } catch {
+                                invalid++;
+                                continue;
+                            }
+                            if (o && o.kind === 'meta') continue;
+                            if (o && o.kind === 'decision') {
+                                if (!validDecision(o)) invalid++;
+                                else if ((o.t ?? 0) > (decT.get(o.id) ?? -Infinity)) {
+                                    decT.set(o.id, o.t ?? 0);
+                                    dec.set(o.id, (({ kind, ...rest }) => rest)(o));
+                                }
+                            } else if (validHandRecord(o)) {
+                                if (have.has(o.gameId)) skipped++;
+                                else {
+                                    have.add(o.gameId);
+                                    add.push(o);
+                                }
+                            } else {
+                                invalid++;
+                            }
                         }
                     }
                     if (add.length) await idbPutMany('hands', add);
-                    if (dec.length) await idbPutMany('decisions', dec);
+                    if (dec.size) await idbPutMany('decisions', [...dec.values()]);
                     await actions.rebuildStats();
+                    /* Hands the backup folder hasn't seen: its next write includes a full copy. */
+                    if (add.length || dec.size) backup.owe();
                     return { ok: true, added: add.length, skipped, invalid };
                 } catch (e) {
                     return { ok: false, error: 'The hands could not be saved in this browser: ' + e.message };
@@ -6078,7 +6819,8 @@
                 return {
                     heroFound: !!(snap && snap.hero), heroSeat: snap && snap.hero ? snap.hero.index : null,
                     hands: handCount, priorsFitted: fitted, priorsBorrowed: Object.keys(pri).length - fitted,
-                    storedText: `${handCount.toLocaleString('en-US')} hands` + (last ? ` · last export ${new Date(last.t).toLocaleDateString()} (${last.hands} hands)` : ' · never exported'),
+                    storedText: `${handCount.toLocaleString('en-US')} hands` + (backup.state().status === 'ready' ? ` · backed up to the folder "${backup.state().folder}"`
+                        : last ? ` · last export ${new Date(last.t).toLocaleDateString()} (${last.hands} hands)` : ' · never exported'),
                 };
             },
             calibrationInfo() {
@@ -6100,6 +6842,13 @@
             openCalibration() {
                 panel.show('calibration');
             },
+            backupState: () => backup.state(),
+            backupSubscribe: (fn) => backup.subscribe(fn),
+            backupChoose: () => backup.choose(),
+            backupRetry: () => backup.retry(),
+            backupAll: () => backup.writeAll(),
+            backupStop: () => backup.stop(),
+            backupKeep: (on) => backup.keep(on),
         };
 
         const panel = createPanel(wrap, {
@@ -6125,6 +6874,7 @@
             handCount = n;
             updateReminder();
         }).catch(() => {});
+        backup.init().catch(() => {});
 
         function onHandComplete(rec) {
             const seated = !!rec.hero && rec.hero in (rec.net || {});
@@ -6136,7 +6886,7 @@
                 if (took) {
                     pending.taken = { type: took.type, toAmount: took.toAmount, allin: !!took.allin };
                     pending.followed = sameAction(pending.advice.best, pending.taken);
-                    idbPut('decisions', pending).catch(() => {});
+                    storeDecision(pending);
                 }
                 pending = null;
             }
@@ -6149,12 +6899,15 @@
                     /* Results computes it later instead */
                 }
             }
-            idbPut('hands', rec).catch(() => {});
+            /* Resuming replays the hand on screen from its start: store it again (keeping when it began), but count it once. */
+            const again = counted.has(rec.gameId);
+            if (again && Number.isFinite(counted.get(rec.gameId))) rec.t0 = Math.min(rec.t0 ?? Infinity, counted.get(rec.gameId));
+            /* Backed up even if IndexedDB refused it: the backup then holds the only copy. */
+            lastStore = idbPut('hands', rec).catch(() => {}).then(() => backup.add('hand', rec));
             resultsCache = null;
-            /* Resuming replays the hand on screen from its start: store it again, but count it once. */
-            if (counted.has(rec.gameId)) return;
-            counted.add(rec.gameId);
-            if (counted.size > 500) counted.delete(counted.values().next().value);
+            if (again) return;
+            counted.set(rec.gameId, rec.t0);
+            if (counted.size > 500) counted.delete(counted.keys().next().value);
             handCount++;
             if (!rec.flags.partial && rec.flags.balanced) {
                 accumulate(players, rec);
@@ -6164,12 +6917,26 @@
             updateReminder();
         }
 
-        /* Shown until you export: hands since the last export reach the "remind me every" setting. */
+        /*
+         * With a backup folder: say only when it is not writing, with the one click that fixes it.
+         * Without: the export reminder, once the hands since the last export reach "remind me every".
+         */
         function updateReminder() {
+            const b = backupState;
+            if (b && b.status !== 'off' && b.status !== 'unsupported') {
+                const waiting = b.waiting ? ` ${b.waiting.toLocaleString('en-US')} hands waiting.` : '';
+                if (b.status === 'paused') panel.setReminder(`Backup paused: Chrome needs you to allow the folder again.${waiting}`, { label: 'Allow folder', onClick: () => backup.retry() });
+                else if (b.status === 'denied') panel.setReminder(`Backup blocked: Chrome refused the folder.${waiting}`, { label: 'Choose folder', onClick: () => backup.choose() });
+                else if (b.status === 'repick') panel.setReminder('Backup: choose the folder again (it is not remembered between visits).', { label: 'Choose folder', onClick: () => backup.choose() });
+                else if (b.status === 'missing') panel.setReminder(`Backup folder "${b.folder}" not found (moved or deleted).${waiting}`, { label: 'Choose folder', onClick: () => backup.choose() });
+                else if (b.status === 'error') panel.setReminder(`Backup could not write: ${b.error}.${waiting}`, { label: 'Try again', onClick: () => backup.retry() });
+                else panel.setReminder(null);
+                return;
+            }
             const saved = gmGet('lastExport', null);
             const exported = saved && Number.isFinite(saved.hands) ? saved.hands : 0;
             const due = settings.exportEvery && handCount - exported >= settings.exportEvery;
-            panel.setReminder(due ? `${(handCount - exported).toLocaleString('en-US')} hands since your last backup: export in Settings › Hand history` : null);
+            panel.setReminder(due ? `${(handCount - exported).toLocaleString('en-US')} hands since your last backup: export, or turn on automatic backup, in Settings › Hand history` : null);
         }
 
         const markInput = (e) => {
@@ -6231,12 +6998,12 @@
         }
 
         function resolvePending(hand, heroName) {
-            if (!pending || !hand || pending.gameId !== hand.gameId) return;
+            if (!pending || !hand || pending.gameId !== (hand.gameId || `partial-${hand.t0}`)) return;
             const taken = hand.actions.slice(pending.i).find((a) => a.who === heroName);
             if (taken) {
                 pending.taken = { type: taken.type, toAmount: taken.toAmount, allin: !!taken.allin };
                 pending.followed = sameAction(pending.advice.best, pending.taken);
-                idbPut('decisions', pending).catch(() => {});
+                storeDecision(pending);
                 pending = null;
             }
         }
@@ -6269,7 +7036,7 @@
                 const mode = result.advice && result.advice.mode;
                 if (hand && (mode === 'allin' || mode === 'legacy' || mode === 'pushfold')) {
                     pending = {
-                        id: `${hand.gameId}#${hand.actions.length}`, gameId: hand.gameId, i: hand.actions.length, street: hand.street, bb: hand.bb,
+                        id: `${hand.gameId || 'partial-' + hand.t0}#${hand.actions.length}`, gameId: hand.gameId || `partial-${hand.t0}`, i: hand.actions.length, street: hand.street, bb: hand.bb,
                         advice: mode === 'allin' ? { ...slimAllIn(result.advice), chart: result.advice.chart ? slimChart(result.advice, hand.bb).chart : null }
                             : mode === 'pushfold' ? slimChart(result.advice, hand.bb) : { ...slim(result.advice), mode: 'legacy' },
                         villainType: result.advice.mainType ? result.advice.mainType.label : null, hero: heroName, t: Date.now(), v: 2, lat,
@@ -6339,6 +7106,8 @@
                     clearTimeout(precomputeTimer);
                     recent.push(`[paused] ${gate.reasons.join('; ')}`);
                     tracker.finish();
+                    /* A pause ends the session: write what is waiting, once the hand just finished is stored. */
+                    lastStore.then(() => backup.flush());
                     logdiff.reset();
                     tiles.clearAll();
                     turnStart.clear();
@@ -6473,6 +7242,8 @@
             else setTimeout(watch, 1000);
         };
         watch();
+        /* Best effort when the tab closes; anything not written stays listed for the next page load. */
+        window.addEventListener('pagehide', () => backup.flush(), { passive: true });
         window.addEventListener('resize', () => {
             /* A panel dragged near an edge must not be left off-screen when the window shrinks (live report 2026-09-27). */
             panel.clampToViewport();

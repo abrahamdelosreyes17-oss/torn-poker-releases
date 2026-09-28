@@ -54,6 +54,7 @@ Then open `https://www.torn.com/page.php?sid=holdem` and click once on the page.
 - **Settings (⚙):**
   - Quick or Learn mode, $ or big blinds, and how strongly reads move the advice
   - tiles and notes
+  - **automatic backup** to a folder you choose once (see below)
   - hand history export and import
   - safety
 
@@ -64,18 +65,26 @@ Then open `https://www.torn.com/page.php?sid=holdem` and click once on the page.
   - **Just watching a table:** it pauses when the window loses focus, or after 60 seconds without a click or key.
 - It **never clicks, types into, or intercepts** Torn's controls. It only notes the time of your own clicks and keys,
   so it can pause when you are idle.
-- **It never touches the network:** no API key, no requests, no `@connect`. Your hand history stays in your browser
-  until you export it yourself.
+- **It never touches the network:** no API key, no requests, no `@connect`. Your hand history stays on your computer:
+  in your browser, and in the backup folder if you choose one. It writes no other files.
 - Every build is scanned for these rules before release.
 
 ## Good to know
 
 - Advice is a guide, and it is only as good as the reads behind it. With few hands on a player it leans on the
   Torn pool average, and says so.
-- Clearing torn.com site data deletes your hand history. Export a backup from Settings › Hand history now and then.
+- Clearing torn.com site data deletes the hand history in your browser. **Turn on automatic backup** in Settings ›
+  Hand history: make a new, empty folder (for example on D:, not in OneDrive, Google Drive or Dropbox) and choose it.
+  Your hands then go there as you play, one file per day, and Import reads them back. After a Chrome restart the panel
+  may ask you to allow the folder again (one click). Chrome gives the folder to torn.com, so use it for nothing else.
 - If something looks wrong, open Settings › About › **Calibration**. It shows exactly what the script reads from the page.
 
 ## Version
+
+**0.7.2** "auto-backup":
+- Hands and your decisions are written to a folder you choose once, so nothing depends on remembering Export. Nothing
+  about a hand in progress is written, and nothing is lost while the backup waits for you to allow the folder.
+- Import takes several files at once.
 
 **0.7.1** "push/fold":
 - A push/fold chart for 2–9 players, 1–20 big blinds, solved offline (about 94 billion simulated deals). Heads-up it
