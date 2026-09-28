@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn TableMind
 // @namespace    torn-tablemind
-// @version      0.6.0
+// @version      0.7.0
 // @description  Hold'em advisor for the Torn poker table you are viewing: correct prices, per-opponent ranges, EV of every action, and your own results. Reads the page only; never plays for you.
 // @author       abrahamdelosreyes17-oss
 // @homepageURL  https://github.com/abrahamdelosreyes17-oss/torn-poker-releases
@@ -32,7 +32,7 @@
 (function () {
     'use strict';
 
-    const TTM_BUILD_VERSION = '0.6.0';
+    const TTM_BUILD_VERSION = '0.7.0';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -158,6 +158,8 @@
         mode: 'learn',
         units: '$',
         exploit: 'capped',
+        /* 0.6's advice outside all-in spots. Off: 0.7 gives verdicts only where it can price them exactly. */
+        legacy: false,
         samples: 10000,
         showEv: true,
         showRange: true,
@@ -705,8 +707,9 @@
         return pots;
     }
 
-    /** Expected chips hero wins from `pots`, given known hole cards and the board so far. */
-    function expectedShare(hands, board, pots, hero, { samples = 20000, seed = 1 } = {}) {
+    /** Expected chips hero wins from `pots`, given known hole cards and the board so far.
+     *  exact: enumerate every runout, even from preflop (1.7M boards: node tools only, never on the page). */
+    function expectedShare(hands, board, pots, hero, { samples = 20000, seed = 1, exact = false } = {}) {
         const used = new Uint8Array(52);
         for (const c of board) used[c] = 1;
         for (const cs of Object.values(hands)) for (const c of cs) used[c] = 1;
@@ -738,6 +741,24 @@
             return got;
         };
         if (need === 0) return one([]);
+        if (exact && need > 2) {
+            let sum = 0;
+            let n = 0;
+            const pick = new Array(need);
+            const rec = (start, depth) => {
+                if (depth === need) {
+                    sum += one(pick);
+                    n++;
+                    return;
+                }
+                for (let i = start; i <= deck.length - (need - depth); i++) {
+                    pick[depth] = deck[i];
+                    rec(i + 1, depth + 1);
+                }
+            };
+            rec(0, 0);
+            return sum / n;
+        }
         if (need <= 2) {
             let sum = 0;
             let n = 0;
@@ -769,11 +790,126 @@
         return sum / samples;
     }
 
+    function weightedLive(weights, used) {
+        const idx = [];
+        const cum = [];
+        let total = 0;
+        for (let k = 0; k < 1326; k++) {
+            const w = weights[k];
+            if (w > 0 && !used[COMBO_A[k]] && !used[COMBO_B[k]]) {
+                total += w;
+                idx.push(k);
+                cum.push(total);
+            }
+        }
+        return { idx, cum, total };
+    }
+
+    function pickCombo(live, r) {
+        const target = r * live.total;
+        let lo = 0;
+        let hi = live.cum.length - 1;
+        while (lo < hi) {
+            const mid = (lo + hi) >> 1;
+            if (live.cum[mid] < target) lo = mid + 1;
+            else hi = mid;
+        }
+        return live.idx[lo];
+    }
+
+    /**
+     * Expected chips hero wins from `pots` when the opponents' hands are weighted ranges (1,326 weights each).
+     * Opponent hands are drawn first (the whole tuple again on a card clash), then the runout, so card
+     * removal is right. Side pots are paid pot by pot; an n-way tie splits.
+     * @param {{ heroCards: number[], board: number[], pots: {amount:number, eligible:string[]}[], hero: string,
+     *          ranges: Record<string, Float32Array>, samples?: number, seed?: number }} a
+     * @returns {{ won: number, se: number, n: number }}
+     */
+    function rangeShare({ heroCards, board, pots, hero, ranges, samples = 12000, seed = 1 }) {
+        const used = new Uint8Array(52);
+        for (const c of heroCards) used[c] = 1;
+        for (const c of board) used[c] = 1;
+        const names = Object.keys(ranges);
+        const lives = names.map((n) => weightedLive(ranges[n], used));
+        if (lives.some((l) => l.total <= 0)) return { won: NaN, se: NaN, n: 0 };
+        const rng = makeRng(seed);
+        const need = 5 - board.length;
+        const clash = new Uint8Array(52);
+        const opp = new Int8Array(names.length * 2);
+        const full = new Array(7);
+        const hand = new Array(7);
+        const deck = new Int8Array(52);
+        const score = Object.create(null);
+        let sum = 0;
+        let sum2 = 0;
+        let n = 0;
+        full[0] = heroCards[0];
+        full[1] = heroCards[1];
+        for (let i = 0; i < board.length; i++) full[2 + i] = board[i];
+        for (let s = 0; s < samples; s++) {
+            let ok = false;
+            for (let tries = 0; tries < 60 && !ok; tries++) {
+                ok = true;
+                clash.fill(0);
+                for (let o = 0; o < names.length; o++) {
+                    const k = pickCombo(lives[o], rng());
+                    const a = COMBO_A[k];
+                    const b = COMBO_B[k];
+                    if (clash[a] || clash[b]) {
+                        ok = false;
+                        break;
+                    }
+                    clash[a] = clash[b] = 1;
+                    opp[2 * o] = a;
+                    opp[2 * o + 1] = b;
+                }
+            }
+            if (!ok) continue;
+            let m = 0;
+            for (let c = 0; c < 52; c++) if (!used[c] && !clash[c]) deck[m++] = c;
+            for (let i = 0; i < need; i++) {
+                const j = i + Math.floor(rng() * (m - i));
+                const t = deck[i];
+                deck[i] = deck[j];
+                deck[j] = t;
+                full[2 + board.length + i] = deck[i];
+            }
+            score[hero] = evaluate(full, 7);
+            for (let i = 2; i < 7; i++) hand[i] = full[i];
+            for (let o = 0; o < names.length; o++) {
+                hand[0] = opp[2 * o];
+                hand[1] = opp[2 * o + 1];
+                score[names[o]] = evaluate(hand, 7);
+            }
+            let got = 0;
+            for (const pot of pots) {
+                if (!pot.eligible.includes(hero)) continue;
+                let best = -1;
+                let cnt = 0;
+                for (const e of pot.eligible) {
+                    const sc = score[e] ?? -1;
+                    if (sc > best) {
+                        best = sc;
+                        cnt = 0;
+                    }
+                    if (sc === best) cnt++;
+                }
+                if (score[hero] === best) got += pot.amount / cnt;
+            }
+            sum += got;
+            sum2 += got * got;
+            n++;
+        }
+        if (!n) return { won: NaN, se: NaN, n: 0 };
+        const mean = sum / n;
+        return { won: mean, se: Math.sqrt(Math.max(0, sum2 / n - mean * mean) / n), n };
+    }
+
     /**
      * @returns {{ ev: number, allIn: true } | null}  hero's EV net in chips, or null when not an all-in
      *          runout or a remaining hand is unknown.
      */
-    function allInEv(rec, heroName, heroCards) {
+    function allInEv(rec, heroName, heroCards, { exact = false } = {}) {
         if (!heroName || !heroCards || heroCards.length !== 2) return null;
         const acts = rec.actions;
         if (!acts.length || !acts.some((a) => a.allin)) return null;
@@ -795,7 +931,7 @@
         for (const a of acts) totals[a.who] = (totals[a.who] || 0) + (a.added || 0);
         for (const u of rec.uncalled || []) totals[u.who] -= u.amount;
         const pots = buildPots(totals, live);
-        const win = expectedShare(hands, boardAt, pots, heroName, { seed: 17 });
+        const win = expectedShare(hands, boardAt, pots, heroName, { seed: 17, exact });
         return { ev: win - totals[heroName], allIn: true };
     }
 
@@ -830,10 +966,18 @@
         };
     }
 
+    /* $500/$1k -> "1k": the stake tag of a record (plan M1), from the big blind. */
+    function stakeTag(bb, unit = '$') {
+        if (!bb) return null;
+        if (unit === 'bb') return 'bb';
+        const f = (x, s) => (Number.isInteger(x) ? String(x) : x.toFixed(1).replace(/\.0$/, '')) + s;
+        return bb >= 1e9 ? f(bb / 1e9, 'b') : bb >= 1e6 ? f(bb / 1e6, 'm') : bb >= 1e3 ? f(bb / 1e3, 'k') : String(bb);
+    }
+
     function player(hand, name) {
         let p = hand.players.get(name);
         if (!p) {
-            p = { name, xid: null, seat: null, stackStart: null, street: 0, total: 0, folded: false, allin: false, sawFlop: false, acted: false };
+            p = { name, xid: null, seat: null, stackStart: null, votes: new Map(), street: 0, total: 0, folded: false, allin: false, sawFlop: false, acted: false };
             hand.players.set(name, p);
             hand.order.push(name);
         }
@@ -863,7 +1007,25 @@
         let button = null;
         let heroName = null;
 
-        function applySeats() {
+        /*
+         * Starting stacks. The page's stack can be a beat ahead of or behind the log, and after an award (or a
+         * replay of a finished hand) it already holds the winnings: 0.6 took the first reading, which gave hero
+         * wrong stacks after a bust or rebuy (3b63af8b: 54 bb recorded, 13.2 bb real). Each fresh page read
+         * votes stack + chips put in; the most frequent value wins. No vote once the pot is awarded.
+         */
+        function vote(p, s) {
+            if (hand.winners.length || !Number.isFinite(s.stack)) return;
+            const v = Math.round((s.stack + p.total) * 100) / 100;
+            p.votes.set(v, (p.votes.get(v) || 0) + 1);
+            let best = null;
+            let n = 0;
+            for (const [k, c] of p.votes) if (c > n) [best, n] = [k, c];
+            p.stackStart = best;
+            p.sure = n >= 2;
+            if (p.sure && p.total > 0 && p.total >= p.stackStart - EPS) p.allin = true;
+        }
+
+        function applySeats(fresh = false) {
             if (!hand) return;
             for (const s of seats) {
                 if (!s.name) continue;
@@ -871,7 +1033,7 @@
                 if (p) {
                     p.xid = s.xid ?? p.xid;
                     p.seat = s.index ?? p.seat;
-                    if (p.stackStart === null && Number.isFinite(s.stack)) p.stackStart = s.stack + p.total;
+                    if (fresh || p.stackStart === null) vote(p, s);
                 }
             }
             if (button !== null && (hand.button === null || hand.actions.length === 0)) hand.button = button;
@@ -881,16 +1043,17 @@
         function add(p, amount) {
             p.street += amount;
             p.total += amount;
-            if (p.stackStart !== null && p.total >= p.stackStart - EPS) p.allin = true;
+            /* Torn logs every all-in as a bare "raised $X"; this is only a backup, so it waits for a confirmed stack. */
+            if (p.sure && p.stackStart !== null && p.total >= p.stackStart - EPS) p.allin = true;
         }
 
-        function act(ev, t) {
+        function act(ev, t, meta) {
             const p = player(hand, ev.who);
             applySeats();
             const potBefore = potOf(hand);
             const facing = Math.max(0, hand.currentBet - p.street);
             const ctx = {
-                i: hand.actions.length, street: hand.street, who: ev.who, type: ev.type, t,
+                i: hand.actions.length, street: hand.street, who: ev.who, type: ev.type, t, ...timing(meta, t),
                 potBefore, facing, currentBet: hand.currentBet, preflopRaises: hand.preflopRaises, limpers: hand.limpers,
                 aggressor: hand.aggressor, prevAggressor: hand.prevAggressor, streetAggressor: hand.streetAggressor,
                 live: liveCount(hand), stackBefore: p.stackStart === null ? null : p.stackStart - p.total,
@@ -941,6 +1104,25 @@
             hand.t1 = t;
         }
 
+        /* HandRecord v2 timing (plan M1): when the line first appeared, when the actor's turn began (Torn's
+           seat timer, if seen), whether it was a repaint burst, seen live or replayed, and page visibility. */
+        function timing(meta, t) {
+            if (!meta) return {};
+            return { tSeen: meta.tSeen ?? t, tTurn: meta.tTurn ?? null, batch: !!meta.batch, seenLive: meta.live !== false, vis: meta.vis ?? null };
+        }
+
+        /* 0.6 froze stackBefore at the first (possibly wrong) stack read; the final stack decides. */
+        function restack(h) {
+            const put = Object.create(null);
+            for (const x of h.posts) put[x.who] = (put[x.who] || 0) + x.amount;
+            for (const a of h.actions) {
+                const p = h.players.get(a.who);
+                const before = put[a.who] || 0;
+                a.stackBefore = p && p.stackStart !== null ? Math.round((p.stackStart - before) * 100) / 100 : null;
+                put[a.who] = before + (a.added || 0);
+            }
+        }
+
         function street(ev) {
             if (hand.street !== ev.street || ev.street === 'preflop') {
                 if (ev.street !== 'preflop') {
@@ -982,6 +1164,7 @@
             hand = null;
             if (!h) return null;
             applySeatsTo(h);
+            restack(h);
             if (!h.winners.length) {
                 const derived = showdownWinners(h);
                 if (derived) {
@@ -1034,9 +1217,11 @@
             const bbSeat = h.posts.find((x) => x.blind === 'bb');
             const seatOf = (name) => h.players.get(name)?.seat ?? undefined;
             const pos = h.button !== null ? positionLabels(occupied, h.button, { sb: sbSeat && seatOf(sbSeat.who), bb: bbSeat && seatOf(bbSeat.who) }) : null;
+            /* Dealt in = posted or acted preflop: n for the per-n tables (plan, variable table size). */
+            const dealt = h.order.filter((name) => h.posts.some((x) => x.who === name) || h.actions.some((a) => a.who === name && a.street === 'preflop'));
             const record = {
-                v: 1, source: 'torn', gameId: h.gameId || `partial-${h.t0}`, t0: h.t0, t1: h.t1,
-                table: { sb: h.sb, bb: h.bb, unit: h.unit || '$' },
+                v: 2, source: 'torn', gameId: h.gameId || `partial-${h.t0}`, t0: h.t0, t1: h.t1,
+                table: { sb: h.sb, bb: h.bb, unit: h.unit || '$' }, stake: stakeTag(h.bb, h.unit || '$'), dealt: dealt.length,
                 hero: h.heroName, heroCards: h.heroCards,
                 seats: h.order.map((name) => {
                     const p = h.players.get(name);
@@ -1061,10 +1246,11 @@
             get hand() {
                 return hand;
             },
+            /** A fresh read of the page's seats (each call votes on starting stacks). */
             setSeats(list, dealerIndex = null) {
                 seats = list || [];
                 if (dealerIndex !== null) button = dealerIndex;
-                applySeats();
+                applySeats(true);
             },
             /** Is the contested pot (everything but the top stack's uncalled excess) awarded yet? */
             awarded() {
@@ -1084,7 +1270,8 @@
                     if (cards && cards.length === 2) hand.heroCards = cards;
                 }
             },
-            feed(ev, t = now()) {
+            /** meta (optional, v2): { tSeen, tTurn, batch, live, vis } for an action line. */
+            feed(ev, t = now(), meta = null) {
                 if (ev.kind === 'start') {
                     if (hand) settle();
                     hand = newHand(ev.gameId, t, false);
@@ -1112,7 +1299,7 @@
                         break;
                     }
                     case 'act':
-                        act(ev, t);
+                        act(ev, t, meta);
                         break;
                     case 'reveal':
                         if (ev.cards.length === 2) hand.shown[ev.who] = ev.cards;
@@ -1141,12 +1328,12 @@
     /* ===== src/generated/tables.js ===== */
     /* Generated by tools/embed-tables.mjs from shared/tables - do not edit. */
 
-    const TABLES_MANIFEST = {"schema":1,"tablesVersion":7,"created":"2026-09-27","classes":"research/math order: AKQJT98765432, suited before offsuit","files":{"equity169.u16":"169x169 uint16 LE, equity*65535, row = hero class","valid169.u8":"169x169 uint8, valid villain combos given a hero combo of the row class","order169.u8":"169 class indexes, strongest first (blend: equity vs random and vs top 25%)","pushfold.json":"HU push/fold frequencies","priors.json":"pool priors per stat","likelihood.json":"postflop action likelihood fitted from showdowns"},"sources":{"priors":{"borrowed-ww":3,"assumed":19,"torn-s5":9,"shape-phh":16,"torn":1},"likelihood":"phh.jsonl"}};
+    const TABLES_MANIFEST = {"schema":1,"tablesVersion":8,"created":"2026-09-28","classes":"research/math order: AKQJT98765432, suited before offsuit","files":{"equity169.u16":"169x169 uint16 LE, equity*65535, row = hero class","valid169.u8":"169x169 uint8, valid villain combos given a hero combo of the row class","order169.u8":"169 class indexes, strongest first (blend: equity vs random and vs top 25%)","pushfold.json":"HU push/fold frequencies","priors.json":"pool priors per stat","likelihood.json":"postflop action likelihood fitted from showdowns"},"sources":{"priors":{"borrowed-ww":3,"assumed":19,"torn-s5":9,"shape-phh":16,"torn":1},"likelihood":"phh.jsonl"}};
     const EQUITY169_B64 = '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iWFoaBFjCGn9YrpqAFbAWTpY/VvmcSN6SnPfejo5JFzjYTNfN2Z9YWJogmJmaeZYSVzbWWFd5XG/eEhzaHrbN+ldpWQnYBlmR2GSZ6dXpVqtXJFgFHIFepZ0+XufNnpgOGYEYYdnmlsNXxZeu2HddUV9g3bwfSczumCAZwpfsGJlYTZkK3c7fpZ7NoLlMF1iQWeXZb1ovHpzg659AIbEMP9/PYbIh8aOXYpIkrNmiZdhoHWZmaEvgMGZ8p8sg/grT1tGYPtarGDVWiRg1FmtXrdaAF90W/Ff1Vr5XhVcP2BTRLlHIke/STxoem46astvuy9eWsxfxlpqX0VaVV7UWmRf2VvEYItbjmD3W7NfV0r9TIxLL0+4aiRxg2xtctkv8FlQXiZZ8l1zWQhe0VpaX0RcHGByWz9fTEvbTt9MYlH3alFwpmwocjwvaletXLRY0F1vWrded1swYG1cWGD0TI5QAE/FUtlq7nDqbNJywi79VKtYm1lDXTlbwF6fW6NfqE4XUgFQAFSzanhwDm2ocWUud1fdW2hZb12jWTReF031UMdSAVdWbD1ymW25c3csWlkjXWVaB1+BUlxV2FS3WE5vJ3VGcIt2aynUWele2FVwWQNXoVsWcYR3R3QEe90lNVo5XbtbVmDJdFt7KngCfwokwnn/f2yCO4kFhYyMh11Ykw2cupSVnQ56DJOemtx8njEfXwtmWV90ZQ1faWXHXr9ksl9bZntfD2VwX49lv1+FZQZLO00zZPxprk0wUDptMHV8NRlf4mQJYDpl5V1lZCdf0WVVX3xm9V6vZb5eKGW6T71TzWakbbRSVFY9cKl3EDXdXRhkRF1PYwte1WR6Xi9lyF8DZiNfgWU2UchUe2awbZJUCVd9cCt4MDXBW7xhTl3MY3NeOmVBX4tlKl/AZVpToFXeZvFt0FS/WNNvIXiMNHdc/GLgXB5jE16HZNVeX2X5VCBY/GatbXJW6lmKcFN3ETVQXPZgc16iZN5eSGWaVqVazGhIcLZYWV1kcch4jjQZXC9j013mY/hXvVomaVxvgF47YVBzmnpbMolfGGXZXCBh+GgLcA1g6mSTdq1+JS9WYUxk92xKc3Rk4miHetOCNyw3eJN9AIB1hoaIg4/gViiVFJ3fjjqUw2N9l5yfToH1JoNYm1xjWMZcQVjvXNdWOVsKWA5dKlj7WlJXj1sKWPJb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';
     const VALID169_B64 = 'AQIGAgYCBgIGAgYCBgIGAgYCBgIGAgYCBgYEDAQMBAwEDAQMBAwEDAQMBAwEDAQMBgQMBAwEDAQMBAwEDAQMBAwEDAQMBgQMBAwEDAQMBAwEDAQMBAwEDAYEDAQMBAwEDAQMBAwEDAQMBgQMBAwEDAQMBAwEDAQMBgQMBAwEDAQMBAwEDAYEDAQMBAwEDAQMBgQMBAwEDAQMBgQMBAwEDAYEDAQMBgQMBgMDBgMJAwkDCQMJAwkDCQMJAwkDCQMJAwkDAwkDCQMJAwkDCQMJAwkDCQMJAwkDCQYEDAQMBAwEDAQMBAwEDAQMBAwEDAYEDAQMBAwEDAQMBAwEDAQMBAwGBAwEDAQMBAwEDAQMBAwEDAYEDAQMBAwEDAQMBAwEDAYEDAQMBAwEDAQMBAwGBAwEDAQMBAwEDAYEDAQMBAwEDAYEDAQMBAwGBAwEDAYEDAYDAgcDCQMJAwkDCQMJAwkDCQMJAwkDCQMJAwMJAwkDCQMJAwkDCQMJAwkDCQMJAwkGBAwEDAQMBAwEDAQMBAwEDAQMBAwGBAwEDAQMBAwEDAQMBAwEDAQMBgQMBAwEDAQMBAwEDAQMBAwGBAwEDAQMBAwEDAQMBAwGBAwEDAQMBAwEDAQMBgQMBAwEDAQMBAwGBAwEDAQMBAwGBAwEDAQMBgQMBAwGBAwGAwMJAwYDCQMJAwkDCQMJAwkDCQMJAwkDCQYDCQQMBAwEDAQMBAwEDAQMBAwEDAQMAwMJAwkDCQMJAwkDCQMJAwkDCQMJBgQMBAwEDAQMBAwEDAQMBAwEDAYEDAQMBAwEDAQMBAwEDAQMBgQMBAwEDAQMBAwEDAQMBgQMBAwEDAQMBAwEDAYEDAQMBAwEDAQMBgQMBAwEDAQMBgQMBAwEDAYEDAQMBgQMBgMDCQIHAwkDCQMJAwkDCQMJAwkDCQMJAwkGAwkEDAQMBAwEDAQMBAwEDAQMBAwEDAMDCQMJAwkDCQMJAwkDCQMJAwkDCQYEDAQMBAwEDAQMBAwEDAQMBAwGBAwEDAQMBAwEDAQMBAwEDAYEDAQMBAwEDAQMBAwEDAYEDAQMBAwEDAQMBAwGBAwEDAQMBAwEDAYEDAQMBAwEDAYEDAQMBAwGBAwEDAYEDAYDAwkDCQMGAwkDCQMJAwkDCQMJAwkDCQMJBgQMAwkEDAQMBAwEDAQMBAwEDAQMBAwGAwkEDAQMBAwEDAQMBAwEDAQMBAwDAwkDCQMJAwkDCQMJAwkDCQMJBgQMBAwEDAQMBAwEDAQMBAwGBAwEDAQMBAwEDAQMBAwGBAwEDAQMBAwEDAQMBgQMBAwEDAQMBAwGBAwEDAQMBAwGBAwEDAQMBgQMBAwGBAwGAwMJAwkCBwMJAwkDCQMJAwkDCQMJAwkDCQYEDAMJBAwEDAQMBAwEDAQMBAwEDAQMBgMJBAwEDAQMBAwEDAQMBAwEDAQMAwMJAwkDCQMJAwkDCQMJAwkDCQYEDAQMBAwEDAQMBAwEDAQMBgQMBAwEDAQMBAwEDAQMBgQMBAwEDAQMBAwEDAYEDAQMBAwEDAQMBgQMBAwEDAQMBgQMBAwEDAYEDAQMBgQMBgMDCQMJAwkDBgMJAwkDCQMJAwkDCQMJAwkGBAwEDAMJBAwEDAQMBAwEDAQMBAwEDAYEDAMJBAwEDAQMBAwEDAQMBAwEDAYDCQQMBAwEDAQMBAwEDAQMBAwDAwkDCQMJAwkDCQMJAwkDCQYEDAQMBAwEDAQMBAwEDAYEDAQMBAwEDAQMBAwGBAwEDAQMBAwEDAYEDAQMBAwEDAYEDAQMBAwGBAwEDAYEDAYDAwkDCQMJAgcDCQMJAwkDCQMJAwkDCQMJBgQMBAwDCQQMBAwEDAQMBAwEDAQMBAwGBAwDCQQMBAwEDAQMBAwEDAQMBAwGAwkEDAQMBAwEDAQMBAwEDAQMAwMJAwkDCQMJAwkDCQMJAwkGBAwEDAQMBAwEDAQMBAwGBAwEDAQMBAwEDAQMBgQMBAwEDAQMBAwGBAwEDAQMBAwGBAwEDAQMBgQMBAwGBAwGAwMJAwkDCQMJAwYDCQMJAwkDCQMJAwkDCQYEDAQMBAwDCQQMBAwEDAQMBAwEDAQMBgQMBAwDCQQMBAwEDAQMBAwEDAQMBgQMAwkEDAQMBAwEDAQMBAwEDAYDCQQMBAwEDAQMBAwEDAQMAwMJAwkDCQMJAwkDCQMJBgQMBAwEDAQMBAwEDAYEDAQMBAwEDAQMBgQMBAwEDAQMBgQMBAwEDAYEDAQMBgQMBgMDCQMJAwkDCQIHAwkDCQMJAwkDCQMJAwkGBAwEDAQMAwkEDAQMBAwEDAQMBAwEDAYEDAQMAwkEDAQMBAwEDAQMBAwEDAYEDAMJBAwEDAQMBAwEDAQMBAwGAwkEDAQMBAwEDAQMBAwEDAMDCQMJAwkDCQMJAwkDCQYEDAQMBAwEDAQMBAwGBAwEDAQMBAwEDAYEDAQMBAwEDAYEDAQMBAwGBAwEDAYEDAYDAwkDCQMJAwkDCQMGAwkDCQMJAwkDCQMJBgQMBAwEDAQMAwkEDAQMBAwEDAQMBAwGBAwEDAQMAwkEDAQMBAwEDAQMBAwGBAwEDAMJBAwEDAQMBAwEDAQMBgQMAwkEDAQMBAwEDAQMBAwGAwkEDAQMBAwEDAQMBAwDAwkDCQMJAwkDCQMJBgQMBAwEDAQMBAwGBAwEDAQMBAwGBAwEDAQMBgQMBAwGBAwGAwMJAwkDCQMJAwkCBwMJAwkDCQMJAwkDCQYEDAQMBAwEDAMJBAwEDAQMBAwEDAQMBgQMBAwEDAMJBAwEDAQMBAwEDAQMBgQMBAwDCQQMBAwEDAQMBAwEDAYEDAMJBAwEDAQMBAwEDAQMBgMJBAwEDAQMBAwEDAQMAwMJAwkDCQMJAwkDCQYEDAQMBAwEDAQMBgQMBAwEDAQMBgQMBAwEDAYEDAQMBgQMBgMDCQMJAwkDCQMJAwkDBgMJAwkDCQMJAwkGBAwEDAQMBAwEDAMJBAwEDAQMBAwEDAYEDAQMBAwEDAMJBAwEDAQMBAwEDAYEDAQMBAwDCQQMBAwEDAQMBAwGBAwEDAMJBAwEDAQMBAwEDAYEDAMJBAwEDAQMBAwEDAYDCQQMBAwEDAQMBAwDAwkDCQMJAwkDCQYEDAQMBAwEDAYEDAQMBAwGBAwEDAYEDAYDAwkDCQMJAwkDCQMJAgcDCQMJAwkDCQMJBgQMBAwEDAQMBAwDCQQMBAwEDAQMBAwGBAwEDAQMBAwDCQQMBAwEDAQMBAwGBAwEDAQMAwkEDAQMBAwEDAQMBgQMBAwDCQQMBAwEDAQMBAwGBAwDCQQMBAwEDAQMBAwGAwkEDAQMBAwEDAQMAwMJAwkDCQMJAwkGBAwEDAQMBAwGBAwEDAQMBgQMBAwGBAwGAwMJAwkDCQMJAwkDCQMJAwYDCQMJAwkDCQYEDAQMBAwEDAQMBAwDCQQMBAwEDAQMBgQMBAwEDAQMBAwDCQQMBAwEDAQMBgQMBAwEDAQMAwkEDAQMBAwEDAYEDAQMBAwDCQQMBAwEDAQMBgQMBAwDCQQMBAwEDAQMBgQMAwkEDAQMBAwEDAYDCQQMBAwEDAQMAwMJAwkDCQMJBgQMBAwEDAYEDAQMBgQMBgMDCQMJAwkDCQMJAwkDCQIHAwkDCQMJAwkGBAwEDAQMBAwEDAQMAwkEDAQMBAwEDAYEDAQMBAwEDAQMAwkEDAQMBAwEDAYEDAQMBAwEDAMJBAwEDAQMBAwGBAwEDAQMAwkEDAQMBAwEDAYEDAQMAwkEDAQMBAwEDAYEDAMJBAwEDAQMBAwGAwkEDAQMBAwEDAMDCQMJAwkDCQYEDAQMBAwGBAwEDAYEDAYDAwkDCQMJAwkDCQMJAwkDCQMGAwkDCQMJBgQMBAwEDAQMBAwEDAQMAwkEDAQMBAwGBAwEDAQMBAwEDAQMAwkEDAQMBAwGBAwEDAQMBAwEDAMJBAwEDAQMBgQMBAwEDAQMAwkEDAQMBAwGBAwEDAQMAwkEDAQMBAwGBAwEDAMJBAwEDAQMBgQMAwkEDAQMBAwGAwkEDAQMBAwDAwkDCQMJBgQMBAwGBAwGAwMJAwkDCQMJAwkDCQMJAwkCBwMJAwkDCQYEDAQMBAwEDAQMBAwEDAMJBAwEDAQMBgQMBAwEDAQMBAwEDAMJBAwEDAQMBgQMBAwEDAQMBAwDCQQMBAwEDAYEDAQMBAwEDAMJBAwEDAQMBgQMBAwEDAMJBAwEDAQMBgQMBAwDCQQMBAwEDAYEDAMJBAwEDAQMBgMJBAwEDAQMAwMJAwkDCQYEDAQMBgQMBgMDCQMJAwkDCQMJAwkDCQMJAwkDBgMJAwkGBAwEDAQMBAwEDAQMBAwEDAMJBAwEDAYEDAQMBAwEDAQMBAwEDAMJBAwEDAYEDAQMBAwEDAQMBAwDCQQMBAwGBAwEDAQMBAwEDAMJBAwEDAYEDAQMBAwEDAMJBAwEDAYEDAQMBAwDCQQMBAwGBAwEDAMJBAwEDAYEDAMJBAwEDAYDCQQMBAwDAwkDCQYEDAYDAwkDCQMJAwkDCQMJAwkDCQMJAgcDCQMJBgQMBAwEDAQMBAwEDAQMBAwDCQQMBAwGBAwEDAQMBAwEDAQMBAwDCQQMBAwGBAwEDAQMBAwEDAQMAwkEDAQMBgQMBAwEDAQMBAwDCQQMBAwGBAwEDAQMBAwDCQQMBAwGBAwEDAQMAwkEDAQMBgQMBAwDCQQMBAwGBAwDCQQMBAwGAwkEDAQMAwMJAwkGBAwGAwMJAwkDCQMJAwkDCQMJAwkDCQMJAwYDCQYEDAQMBAwEDAQMBAwEDAQMBAwDCQQMBgQMBAwEDAQMBAwEDAQMBAwDCQQMBgQMBAwEDAQMBAwEDAQMAwkEDAYEDAQMBAwEDAQMBAwDCQQMBgQMBAwEDAQMBAwDCQQMBgQMBAwEDAQMAwkEDAYEDAQMBAwDCQQMBgQMBAwDCQQMBgQMAwkEDAYDCQQMAwMJBgMDCQMJAwkDCQMJAwkDCQMJAwkDCQIHAwkGBAwEDAQMBAwEDAQMBAwEDAQMAwkEDAYEDAQMBAwEDAQMBAwEDAQMAwkEDAYEDAQMBAwEDAQMBAwEDAMJBAwGBAwEDAQMBAwEDAQMAwkEDAYEDAQMBAwEDAQMAwkEDAYEDAQMBAwEDAMJBAwGBAwEDAQMAwkEDAYEDAQMAwkEDAYEDAMJBAwGAwkEDAMDCQYDAwkDCQMJAwkDCQMJAwkDCQMJAwkDCQMGBgQMBAwEDAQMBAwEDAQMBAwEDAQMAwkGBAwEDAQMBAwEDAQMBAwEDAQMAwkGBAwEDAQMBAwEDAQMBAwEDAMJBgQMBAwEDAQMBAwEDAQMAwkGBAwEDAQMBAwEDAQMAwkGBAwEDAQMBAwEDAMJBgQMBAwEDAQMAwkGBAwEDAQMAwkGBAwEDAMJBgQMAwkGAwkDAwMJAwkDCQMJAwkDCQMJAwkDCQMJAwkCBwYEDAQMBAwEDAQMBAwEDAQMBAwEDAMJBgQMBAwEDAQMBAwEDAQMBAwEDAMJBgQMBAwEDAQMBAwEDAQMBAwDCQYEDAQMBAwEDAQMBAwEDAMJBgQMBAwEDAQMBAwEDAMJBgQMBAwEDAQMBAwDCQYEDAQMBAwEDAMJBgQMBAwEDAMJBgQMBAwDCQYEDAMJBgMJAwYCBgQMBAwEDAQMBAwEDAQMBAwEDAQMBAwBAgYCBgIGAgYCBgIGAgYCBgIGAgYCBgYEDAQMBAwEDAQMBAwEDAQMBAwEDAYEDAQMBAwEDAQMBAwEDAQMBAwGBAwEDAQMBAwEDAQMBAwEDAYEDAQMBAwEDAQMBAwEDAYEDAQMBAwEDAQMBAwGBAwEDAQMBAwEDAYEDAQMBAwEDAYEDAQMBAwGBAwEDAYEDAYGAwkDCQQMBAwEDAQMBAwEDAQMBAwEDAQMAwMGAwkDCQMJAwkDCQMJAwkDCQMJAwkDAwkDCQMJAwkDCQMJAwkDCQMJAwkGBAwEDAQMBAwEDAQMBAwEDAQMBgQMBAwEDAQMBAwEDAQMBAwGBAwEDAQMBAwEDAQMBAwGBAwEDAQMBAwEDAQMBgQMBAwEDAQMBAwGBAwEDAQMBAwGBAwEDAQMBgQMBAwGBAwGBgMJAwkEDAQMBAwEDAQMBAwEDAQMBAwEDAMCBwMJAwkDCQMJAwkDCQMJAwkDCQMJAwMJAwkDCQMJAwkDCQMJAwkDCQMJBgQMBAwEDAQMBAwEDAQMBAwEDAYEDAQMBAwEDAQMBAwEDAQMBgQMBAwEDAQMBAwEDAQMBgQMBAwEDAQMBAwEDAYEDAQMBAwEDAQMBgQMBAwEDAQMBgQMBAwEDAYEDAQMBgQMBgYDCQQMAwkEDAQMBAwEDAQMBAwEDAQMBAwDAwkDBgMJAwkDCQMJAwkDCQMJAwkDCQYDCQQMBAwEDAQMBAwEDAQMBAwEDAMDCQMJAwkDCQMJAwkDCQMJAwkGBAwEDAQMBAwEDAQMBAwEDAYEDAQMBAwEDAQMBAwEDAYEDAQMBAwEDAQMBAwGBAwEDAQMBAwEDAYEDAQMBAwEDAYEDAQMBAwGBAwEDAYEDAYGAwkEDAMJBAwEDAQMBAwEDAQMBAwEDAQMAwMJAgcDCQMJAwkDCQMJAwkDCQMJAwkGAwkEDAQMBAwEDAQMBAwEDAQMBAwDAwkDCQMJAwkDCQMJAwkDCQMJBgQMBAwEDAQMBAwEDAQMBAwGBAwEDAQMBAwEDAQMBAwGBAwEDAQMBAwEDAQMBgQMBAwEDAQMBAwGBAwEDAQMBAwGBAwEDAQMBgQMBAwGBAwGBgMJBAwEDAMJBAwEDAQMBAwEDAQMBAwEDAMDCQMJAwYDCQMJAwkDCQMJAwkDCQMJBgQMAwkEDAQMBAwEDAQMBAwEDAQMBgMJBAwEDAQMBAwEDAQMBAwEDAMDCQMJAwkDCQMJAwkDCQMJBgQMBAwEDAQMBAwEDAQMBgQMBAwEDAQMBAwEDAYEDAQMBAwEDAQMBgQMBAwEDAQMBgQMBAwEDAYEDAQMBgQMBgYDCQQMBAwDCQQMBAwEDAQMBAwEDAQMBAwDAwkDCQIHAwkDCQMJAwkDCQMJAwkDCQYEDAMJBAwEDAQMBAwEDAQMBAwEDAYDCQQMBAwEDAQMBAwEDAQMBAwDAwkDCQMJAwkDCQMJAwkDCQYEDAQMBAwEDAQMBAwEDAYEDAQMBAwEDAQMBAwGBAwEDAQMBAwEDAYEDAQMBAwEDAYEDAQMBAwGBAwEDAYEDAYGAwkEDAQMBAwDCQQMBAwEDAQMBAwEDAQMAwMJAwkDCQMGAwkDCQMJAwkDCQMJAwkGBAwEDAMJBAwEDAQMBAwEDAQMBAwGBAwDCQQMBAwEDAQMBAwEDAQMBgMJBAwEDAQMBAwEDAQMBAwDAwkDCQMJAwkDCQMJAwkGBAwEDAQMBAwEDAQMBgQMBAwEDAQMBAwGBAwEDAQMBAwGBAwEDAQMBgQMBAwGBAwGBgMJBAwEDAQMAwkEDAQMBAwEDAQMBAwEDAMDCQMJAwkCBwMJAwkDCQMJAwkDCQMJBgQMBAwDCQQMBAwEDAQMBAwEDAQMBgQMAwkEDAQMBAwEDAQMBAwEDAYDCQQMBAwEDAQMBAwEDAQMAwMJAwkDCQMJAwkDCQMJBgQMBAwEDAQMBAwEDAYEDAQMBAwEDAQMBgQMBAwEDAQMBgQMBAwEDAYEDAQMBgQMBgYDCQQMBAwEDAQMAwkEDAQMBAwEDAQMBAwDAwkDCQMJAwkDBgMJAwkDCQMJAwkDCQYEDAQMBAwDCQQMBAwEDAQMBAwEDAYEDAQMAwkEDAQMBAwEDAQMBAwGBAwDCQQMBAwEDAQMBAwEDAYDCQQMBAwEDAQMBAwEDAMDCQMJAwkDCQMJAwkGBAwEDAQMBAwEDAYEDAQMBAwEDAYEDAQMBAwGBAwEDAYEDAYGAwkEDAQMBAwEDAMJBAwEDAQMBAwEDAQMAwMJAwkDCQMJAgcDCQMJAwkDCQMJAwkGBAwEDAQMAwkEDAQMBAwEDAQMBAwGBAwEDAMJBAwEDAQMBAwEDAQMBgQMAwkEDAQMBAwEDAQMBAwGAwkEDAQMBAwEDAQMBAwDAwkDCQMJAwkDCQMJBgQMBAwEDAQMBAwGBAwEDAQMBAwGBAwEDAQMBgQMBAwGBAwGBgMJBAwEDAQMBAwEDAMJBAwEDAQMBAwEDAMDCQMJAwkDCQMJAwYDCQMJAwkDCQMJBgQMBAwEDAQMAwkEDAQMBAwEDAQMBgQMBAwEDAMJBAwEDAQMBAwEDAYEDAQMAwkEDAQMBAwEDAQMBgQMAwkEDAQMBAwEDAQMBgMJBAwEDAQMBAwEDAMDCQMJAwkDCQMJBgQMBAwEDAQMBgQMBAwEDAYEDAQMBgQMBgYDCQQMBAwEDAQMBAwDCQQMBAwEDAQMBAwDAwkDCQMJAwkDCQIHAwkDCQMJAwkDCQYEDAQMBAwEDAMJBAwEDAQMBAwEDAYEDAQMBAwDCQQMBAwEDAQMBAwGBAwEDAMJBAwEDAQMBAwEDAYEDAMJBAwEDAQMBAwEDAYDCQQMBAwEDAQMBAwDAwkDCQMJAwkDCQYEDAQMBAwEDAYEDAQMBAwGBAwEDAYEDAYGAwkEDAQMBAwEDAQMBAwDCQQMBAwEDAQMAwMJAwkDCQMJAwkDCQMGAwkDCQMJAwkGBAwEDAQMBAwEDAMJBAwEDAQMBAwGBAwEDAQMBAwDCQQMBAwEDAQMBgQMBAwEDAMJBAwEDAQMBAwGBAwEDAMJBAwEDAQMBAwGBAwDCQQMBAwEDAQMBgMJBAwEDAQMBAwDAwkDCQMJAwkGBAwEDAQMBgQMBAwGBAwGBgMJBAwEDAQMBAwEDAQMAwkEDAQMBAwEDAMDCQMJAwkDCQMJAwkCBwMJAwkDCQMJBgQMBAwEDAQMBAwDCQQMBAwEDAQMBgQMBAwEDAQMAwkEDAQMBAwEDAYEDAQMBAwDCQQMBAwEDAQMBgQMBAwDCQQMBAwEDAQMBgQMAwkEDAQMBAwEDAYDCQQMBAwEDAQMAwMJAwkDCQMJBgQMBAwEDAYEDAQMBgQMBgYDCQQMBAwEDAQMBAwEDAQMAwkEDAQMBAwDAwkDCQMJAwkDCQMJAwkDBgMJAwkDCQYEDAQMBAwEDAQMBAwDCQQMBAwEDAYEDAQMBAwEDAQMAwkEDAQMBAwGBAwEDAQMBAwDCQQMBAwEDAYEDAQMBAwDCQQMBAwEDAYEDAQMAwkEDAQMBAwGBAwDCQQMBAwEDAYDCQQMBAwEDAMDCQMJAwkGBAwEDAYEDAYGAwkEDAQMBAwEDAQMBAwEDAMJBAwEDAQMAwMJAwkDCQMJAwkDCQMJAgcDCQMJAwkGBAwEDAQMBAwEDAQMAwkEDAQMBAwGBAwEDAQMBAwEDAMJBAwEDAQMBgQMBAwEDAQMAwkEDAQMBAwGBAwEDAQMAwkEDAQMBAwGBAwEDAMJBAwEDAQMBgQMAwkEDAQMBAwGAwkEDAQMBAwDAwkDCQMJBgQMBAwGBAwGBgMJBAwEDAQMBAwEDAQMBAwEDAMJBAwEDAMDCQMJAwkDCQMJAwkDCQMJAwYDCQMJBgQMBAwEDAQMBAwEDAQMAwkEDAQMBgQMBAwEDAQMBAwEDAMJBAwEDAYEDAQMBAwEDAQMAwkEDAQMBgQMBAwEDAQMAwkEDAQMBgQMBAwEDAMJBAwEDAYEDAQMAwkEDAQMBgQMAwkEDAQMBgMJBAwEDAMDCQMJBgQMBgYDCQQMBAwEDAQMBAwEDAQMBAwDCQQMBAwDAwkDCQMJAwkDCQMJAwkDCQIHAwkDCQYEDAQMBAwEDAQMBAwEDAMJBAwEDAYEDAQMBAwEDAQMBAwDCQQMBAwGBAwEDAQMBAwEDAMJBAwEDAYEDAQMBAwEDAMJBAwEDAYEDAQMBAwDCQQMBAwGBAwEDAMJBAwEDAYEDAMJBAwEDAYDCQQMBAwDAwkDCQYEDAYGAwkEDAQMBAwEDAQMBAwEDAQMBAwDCQQMAwMJAwkDCQMJAwkDCQMJAwkDCQMGAwkGBAwEDAQMBAwEDAQMBAwEDAMJBAwGBAwEDAQMBAwEDAQMBAwDCQQMBgQMBAwEDAQMBAwEDAMJBAwGBAwEDAQMBAwEDAMJBAwGBAwEDAQMBAwDCQQMBgQMBAwEDAMJBAwGBAwEDAMJBAwGBAwDCQQMBgMJBAwDAwkGBgMJBAwEDAQMBAwEDAQMBAwEDAQMAwkEDAMDCQMJAwkDCQMJAwkDCQMJAwkCBwMJBgQMBAwEDAQMBAwEDAQMBAwDCQQMBgQMBAwEDAQMBAwEDAQMAwkEDAYEDAQMBAwEDAQMBAwDCQQMBgQMBAwEDAQMBAwDCQQMBgQMBAwEDAQMAwkEDAYEDAQMBAwDCQQMBgQMBAwDCQQMBgQMAwkEDAYDCQQMAwMJBgYDCQQMBAwEDAQMBAwEDAQMBAwEDAQMAwkDAwkDCQMJAwkDCQMJAwkDCQMJAwkDBgYEDAQMBAwEDAQMBAwEDAQMBAwDCQYEDAQMBAwEDAQMBAwEDAQMAwkGBAwEDAQMBAwEDAQMBAwDCQYEDAQMBAwEDAQMBAwDCQYEDAQMBAwEDAQMAwkGBAwEDAQMBAwDCQYEDAQMBAwDCQYEDAQMAwkGBAwDCQYDCQMGAwkEDAQMBAwEDAQMBAwEDAQMBAwEDAMJAwMJAwkDCQMJAwkDCQMJAwkDCQMJAgcGBAwEDAQMBAwEDAQMBAwEDAQMAwkGBAwEDAQMBAwEDAQMBAwEDAMJBgQMBAwEDAQMBAwEDAQMAwkGBAwEDAQMBAwEDAQMAwkGBAwEDAQMBAwEDAMJBgQMBAwEDAQMAwkGBAwEDAQMAwkGBAwEDAMJBgQMAwkGAwkDBgQMAgYEDAQMBAwEDAQMBAwEDAQMBAwEDAYCBgQMBAwEDAQMBAwEDAQMBAwEDAQMAQIGAgYCBgIGAgYCBgIGAgYCBgIGBgQMBAwEDAQMBAwEDAQMBAwEDAYEDAQMBAwEDAQMBAwEDAQMBgQMBAwEDAQMBAwEDAQMBgQMBAwEDAQMBAwEDAYEDAQMBAwEDAQMBgQMBAwEDAQMBgQMBAwEDAYEDAQMBgQMBgYEDAMJAwkEDAQMBAwEDAQMBAwEDAQMBAwGAwkDCQQMBAwEDAQMBAwEDAQMBAwEDAMDBgMJAwkDCQMJAwkDCQMJAwkDCQMDCQMJAwkDCQMJAwkDCQMJAwkGBAwEDAQMBAwEDAQMBAwEDAYEDAQMBAwEDAQMBAwEDAYEDAQMBAwEDAQMBAwGBAwEDAQMBAwEDAYEDAQMBAwEDAYEDAQMBAwGBAwEDAYEDAYGBAwDCQMJBAwEDAQMBAwEDAQMBAwEDAQMBgMJAwkEDAQMBAwEDAQMBAwEDAQMBAwDAgcDCQMJAwkDCQMJAwkDCQMJAwkDAwkDCQMJAwkDCQMJAwkDCQMJBgQMBAwEDAQMBAwEDAQMBAwGBAwEDAQMBAwEDAQMBAwGBAwEDAQMBAwEDAQMBgQMBAwEDAQMBAwGBAwEDAQMBAwGBAwEDAQMBgQMBAwGBAwGBgQMAwkEDAMJBAwEDAQMBAwEDAQMBAwEDAYDCQQMAwkEDAQMBAwEDAQMBAwEDAQMAwMJAwYDCQMJAwkDCQMJAwkDCQMJBgMJBAwEDAQMBAwEDAQMBAwEDAMDCQMJAwkDCQMJAwkDCQMJBgQMBAwEDAQMBAwEDAQMBgQMBAwEDAQMBAwEDAYEDAQMBAwEDAQMBgQMBAwEDAQMBgQMBAwEDAYEDAQMBgQMBgYEDAMJBAwDCQQMBAwEDAQMBAwEDAQMBAwGAwkEDAMJBAwEDAQMBAwEDAQMBAwEDAMDCQIHAwkDCQMJAwkDCQMJAwkDCQYDCQQMBAwEDAQMBAwEDAQMBAwDAwkDCQMJAwkDCQMJAwkDCQYEDAQMBAwEDAQMBAwEDAYEDAQMBAwEDAQMBAwGBAwEDAQMBAwEDAYEDAQMBAwEDAYEDAQMBAwGBAwEDAYEDAYGBAwDCQQMBAwDCQQMBAwEDAQMBAwEDAQMBgMJBAwEDAMJBAwEDAQMBAwEDAQMBAwDAwkDCQMGAwkDCQMJAwkDCQMJAwkGBAwDCQQMBAwEDAQMBAwEDAQMBgMJBAwEDAQMBAwEDAQMBAwDAwkDCQMJAwkDCQMJAwkGBAwEDAQMBAwEDAQMBgQMBAwEDAQMBAwGBAwEDAQMBAwGBAwEDAQMBgQMBAwGBAwGBgQMAwkEDAQMAwkEDAQMBAwEDAQMBAwEDAYDCQQMBAwDCQQMBAwEDAQMBAwEDAQMAwMJAwkCBwMJAwkDCQMJAwkDCQMJBgQMAwkEDAQMBAwEDAQMBAwEDAYDCQQMBAwEDAQMBAwEDAQMAwMJAwkDCQMJAwkDCQMJBgQMBAwEDAQMBAwEDAYEDAQMBAwEDAQMBgQMBAwEDAQMBgQMBAwEDAYEDAQMBgQMBgYEDAMJBAwEDAQMAwkEDAQMBAwEDAQMBAwGAwkEDAQMBAwDCQQMBAwEDAQMBAwEDAMDCQMJAwkDBgMJAwkDCQMJAwkDCQYEDAQMAwkEDAQMBAwEDAQMBAwGBAwDCQQMBAwEDAQMBAwEDAYDCQQMBAwEDAQMBAwEDAMDCQMJAwkDCQMJAwkGBAwEDAQMBAwEDAYEDAQMBAwEDAYEDAQMBAwGBAwEDAYEDAYGBAwDCQQMBAwEDAMJBAwEDAQMBAwEDAQMBgMJBAwEDAQMAwkEDAQMBAwEDAQMBAwDAwkDCQMJAgcDCQMJAwkDCQMJAwkGBAwEDAMJBAwEDAQMBAwEDAQMBgQMAwkEDAQMBAwEDAQMBAwGAwkEDAQMBAwEDAQMBAwDAwkDCQMJAwkDCQMJBgQMBAwEDAQMBAwGBAwEDAQMBAwGBAwEDAQMBgQMBAwGBAwGBgQMAwkEDAQMBAwEDAMJBAwEDAQMBAwEDAYDCQQMBAwEDAQMAwkEDAQMBAwEDAQMAwMJAwkDCQMJAwYDCQMJAwkDCQMJBgQMBAwEDAMJBAwEDAQMBAwEDAYEDAQMAwkEDAQMBAwEDAQMBgQMAwkEDAQMBAwEDAQMBgMJBAwEDAQMBAwEDAMDCQMJAwkDCQMJBgQMBAwEDAQMBgQMBAwEDAYEDAQMBgQMBgYEDAMJBAwEDAQMBAwDCQQMBAwEDAQMBAwGAwkEDAQMBAwEDAMJBAwEDAQMBAwEDAMDCQMJAwkDCQIHAwkDCQMJAwkDCQYEDAQMBAwDCQQMBAwEDAQMBAwGBAwEDAMJBAwEDAQMBAwEDAYEDAMJBAwEDAQMBAwEDAYDCQQMBAwEDAQMBAwDAwkDCQMJAwkDCQYEDAQMBAwEDAYEDAQMBAwGBAwEDAYEDAYGBAwDCQQMBAwEDAQMBAwDCQQMBAwEDAQMBgMJBAwEDAQMBAwEDAMJBAwEDAQMBAwDAwkDCQMJAwkDCQMGAwkDCQMJAwkGBAwEDAQMBAwDCQQMBAwEDAQMBgQMBAwEDAMJBAwEDAQMBAwGBAwEDAMJBAwEDAQMBAwGBAwDCQQMBAwEDAQMBgMJBAwEDAQMBAwDAwkDCQMJAwkGBAwEDAQMBgQMBAwGBAwGBgQMAwkEDAQMBAwEDAQMAwkEDAQMBAwEDAYDCQQMBAwEDAQMBAwDCQQMBAwEDAQMAwMJAwkDCQMJAwkCBwMJAwkDCQMJBgQMBAwEDAQMAwkEDAQMBAwEDAYEDAQMBAwDCQQMBAwEDAQMBgQMBAwDCQQMBAwEDAQMBgQMAwkEDAQMBAwEDAYDCQQMBAwEDAQMAwMJAwkDCQMJBgQMBAwEDAYEDAQMBgQMBgYEDAMJBAwEDAQMBAwEDAQMAwkEDAQMBAwGAwkEDAQMBAwEDAQMBAwDCQQMBAwEDAMDCQMJAwkDCQMJAwkDBgMJAwkDCQYEDAQMBAwEDAQMAwkEDAQMBAwGBAwEDAQMBAwDCQQMBAwEDAYEDAQMBAwDCQQMBAwEDAYEDAQMAwkEDAQMBAwGBAwDCQQMBAwEDAYDCQQMBAwEDAMDCQMJAwkGBAwEDAYEDAYGBAwDCQQMBAwEDAQMBAwEDAMJBAwEDAQMBgMJBAwEDAQMBAwEDAQMAwkEDAQMBAwDAwkDCQMJAwkDCQMJAgcDCQMJAwkGBAwEDAQMBAwEDAMJBAwEDAQMBgQMBAwEDAQMAwkEDAQMBAwGBAwEDAQMAwkEDAQMBAwGBAwEDAMJBAwEDAQMBgQMAwkEDAQMBAwGAwkEDAQMBAwDAwkDCQMJBgQMBAwGBAwGBgQMAwkEDAQMBAwEDAQMBAwEDAMJBAwEDAYDCQQMBAwEDAQMBAwEDAQMAwkEDAQMAwMJAwkDCQMJAwkDCQMJAwYDCQMJBgQMBAwEDAQMBAwEDAMJBAwEDAYEDAQMBAwEDAQMAwkEDAQMBgQMBAwEDAQMAwkEDAQMBgQMBAwEDAMJBAwEDAYEDAQMAwkEDAQMBgQMAwkEDAQMBgMJBAwEDAMDCQMJBgQMBgYEDAMJBAwEDAQMBAwEDAQMBAwDCQQMBAwGAwkEDAQMBAwEDAQMBAwEDAMJBAwEDAMDCQMJAwkDCQMJAwkDCQIHAwkDCQYEDAQMBAwEDAQMBAwDCQQMBAwGBAwEDAQMBAwEDAMJBAwEDAYEDAQMBAwEDAMJBAwEDAYEDAQMBAwDCQQMBAwGBAwEDAMJBAwEDAYEDAMJBAwEDAYDCQQMBAwDAwkDCQYEDAYGBAwDCQQMBAwEDAQMBAwEDAQMBAwDCQQMBgMJBAwEDAQMBAwEDAQMBAwEDAMJBAwDAwkDCQMJAwkDCQMJAwkDCQMGAwkGBAwEDAQMBAwEDAQMBAwDCQQMBgQMBAwEDAQMBAwEDAMJBAwGBAwEDAQMBAwEDAMJBAwGBAwEDAQMBAwDCQQMBgQMBAwEDAMJBAwGBAwEDAMJBAwGBAwDCQQMBgMJBAwDAwkGBgQMAwkEDAQMBAwEDAQMBAwEDAQMAwkEDAYDCQQMBAwEDAQMBAwEDAQMBAwDCQQMAwMJAwkDCQMJAwkDCQMJAwkCBwMJBgQMBAwEDAQMBAwEDAQMAwkEDAYEDAQMBAwEDAQMBAwDCQQMBgQMBAwEDAQMBAwDCQQMBgQMBAwEDAQMAwkEDAYEDAQMBAwDCQQMBgQMBAwDCQQMBgQMAwkEDAYDCQQMAwMJBgYEDAMJBAwEDAQMBAwEDAQMBAwEDAQMAwkGAwkEDAQMBAwEDAQMBAwEDAQMBAwDCQMDCQMJAwkDCQMJAwkDCQMJAwkDBgYEDAQMBAwEDAQMBAwEDAQMAwkGBAwEDAQMBAwEDAQMBAwDCQYEDAQMBAwEDAQMBAwDCQYEDAQMBAwEDAQMAwkGBAwEDAQMBAwDCQYEDAQMBAwDCQYEDAQMAwkGBAwDCQYDCQMGBAwDCQQMBAwEDAQMBAwEDAQMBAwEDAMJBgMJBAwEDAQMBAwEDAQMBAwEDAQMAwkDAwkDCQMJAwkDCQMJAwkDCQMJAgcGBAwEDAQMBAwEDAQMBAwEDAMJBgQMBAwEDAQMBAwEDAQMAwkGBAwEDAQMBAwEDAQMAwkGBAwEDAQMBAwEDAMJBgQMBAwEDAQMAwkGBAwEDAQMAwkGBAwEDAMJBgQMAwkGAwkDBgQMBAwCBgQMBAwEDAQMBAwEDAQMBAwEDAYEDAIGBAwEDAQMBAwEDAQMBAwEDAQMBgIGBAwEDAQMBAwEDAQMBAwEDAQMAQIGAgYCBgIGAgYCBgIGAgYCBgYEDAQMBAwEDAQMBAwEDAQMBgQMBAwEDAQMBAwEDAQMBgQMBAwEDAQMBAwEDAYEDAQMBAwEDAQMBgQMBAwEDAQMBgQMBAwEDAYEDAQMBgQMBgYEDAQMAwkDCQQMBAwEDAQMBAwEDAQMBAwGBAwDCQMJBAwEDAQMBAwEDAQMBAwEDAYDCQMJBAwEDAQMBAwEDAQMBAwEDAMDBgMJAwkDCQMJAwkDCQMJAwkDAwkDCQMJAwkDCQMJAwkDCQYEDAQMBAwEDAQMBAwEDAYEDAQMBAwEDAQMBAwGBAwEDAQMBAwEDAYEDAQMBAwEDAYEDAQMBAwGBAwEDAYEDAYGBAwEDAMJAwkEDAQMBAwEDAQMBAwEDAQMBgQMAwkDCQQMBAwEDAQMBAwEDAQMBAwGAwkDCQQMBAwEDAQMBAwEDAQMBAwDAgcDCQMJAwkDCQMJAwkDCQMJAwMJAwkDCQMJAwkDCQMJAwkGBAwEDAQMBAwEDAQMBAwGBAwEDAQMBAwEDAQMBgQMBAwEDAQMBAwGBAwEDAQMBAwGBAwEDAQMBgQMBAwGBAwGBgQMBAwDCQQMAwkEDAQMBAwEDAQMBAwEDAYEDAMJBAwDCQQMBAwEDAQMBAwEDAQMBgMJBAwDCQQMBAwEDAQMBAwEDAQMAwMJAwYDCQMJAwkDCQMJAwkDCQYDCQQMBAwEDAQMBAwEDAQMAwMJAwkDCQMJAwkDCQMJBgQMBAwEDAQMBAwEDAYEDAQMBAwEDAQMBgQMBAwEDAQMBgQMBAwEDAYEDAQMBgQMBgYEDAQMAwkEDAMJBAwEDAQMBAwEDAQMBAwGBAwDCQQMAwkEDAQMBAwEDAQMBAwEDAYDCQQMAwkEDAQMBAwEDAQMBAwEDAMDCQIHAwkDCQMJAwkDCQMJAwkGAwkEDAQMBAwEDAQMBAwEDAMDCQMJAwkDCQMJAwkDCQYEDAQMBAwEDAQMBAwGBAwEDAQMBAwEDAYEDAQMBAwEDAYEDAQMBAwGBAwEDAYEDAYGBAwEDAMJBAwEDAMJBAwEDAQMBAwEDAQMBgQMAwkEDAQMAwkEDAQMBAwEDAQMBAwGAwkEDAQMAwkEDAQMBAwEDAQMBAwDAwkDCQMGAwkDCQMJAwkDCQMJBgQMAwkEDAQMBAwEDAQMBAwGAwkEDAQMBAwEDAQMBAwDAwkDCQMJAwkDCQMJBgQMBAwEDAQMBAwGBAwEDAQMBAwGBAwEDAQMBgQMBAwGBAwGBgQMBAwDCQQMBAwDCQQMBAwEDAQMBAwEDAYEDAMJBAwEDAMJBAwEDAQMBAwEDAQMBgMJBAwEDAMJBAwEDAQMBAwEDAQMAwMJAwkCBwMJAwkDCQMJAwkDCQYEDAMJBAwEDAQMBAwEDAQMBgMJBAwEDAQMBAwEDAQMAwMJAwkDCQMJAwkDCQYEDAQMBAwEDAQMBgQMBAwEDAQMBgQMBAwEDAYEDAQMBgQMBgYEDAQMAwkEDAQMBAwDCQQMBAwEDAQMBAwGBAwDCQQMBAwEDAMJBAwEDAQMBAwEDAYDCQQMBAwEDAMJBAwEDAQMBAwEDAMDCQMJAwkDBgMJAwkDCQMJAwkGBAwEDAMJBAwEDAQMBAwEDAYEDAMJBAwEDAQMBAwEDAYDCQQMBAwEDAQMBAwDAwkDCQMJAwkDCQYEDAQMBAwEDAYEDAQMBAwGBAwEDAYEDAYGBAwEDAMJBAwEDAQMAwkEDAQMBAwEDAQMBgQMAwkEDAQMBAwDCQQMBAwEDAQMBAwGAwkEDAQMBAwDCQQMBAwEDAQMBAwDAwkDCQMJAgcDCQMJAwkDCQMJBgQMBAwDCQQMBAwEDAQMBAwGBAwDCQQMBAwEDAQMBAwGAwkEDAQMBAwEDAQMAwMJAwkDCQMJAwkGBAwEDAQMBAwGBAwEDAQMBgQMBAwGBAwGBgQMBAwDCQQMBAwEDAQMAwkEDAQMBAwEDAYEDAMJBAwEDAQMBAwDCQQMBAwEDAQMBgMJBAwEDAQMBAwDCQQMBAwEDAQMAwMJAwkDCQMJAwYDCQMJAwkDCQYEDAQMBAwDCQQMBAwEDAQMBgQMBAwDCQQMBAwEDAQMBgQMAwkEDAQMBAwEDAYDCQQMBAwEDAQMAwMJAwkDCQMJBgQMBAwEDAYEDAQMBgQMBgYEDAQMAwkEDAQMBAwEDAMJBAwEDAQMBAwGBAwDCQQMBAwEDAQMAwkEDAQMBAwEDAYDCQQMBAwEDAQMAwkEDAQMBAwEDAMDCQMJAwkDCQIHAwkDCQMJAwkGBAwEDAQMAwkEDAQMBAwEDAYEDAQMAwkEDAQMBAwEDAYEDAMJBAwEDAQMBAwGAwkEDAQMBAwEDAMDCQMJAwkDCQYEDAQMBAwGBAwEDAYEDAYGBAwEDAMJBAwEDAQMBAwEDAMJBAwEDAQMBgQMAwkEDAQMBAwEDAQMAwkEDAQMBAwGAwkEDAQMBAwEDAQMAwkEDAQMBAwDAwkDCQMJAwkDCQMGAwkDCQMJBgQMBAwEDAQMAwkEDAQMBAwGBAwEDAQMAwkEDAQMBAwGBAwEDAMJBAwEDAQMBgQMAwkEDAQMBAwGAwkEDAQMBAwDAwkDCQMJBgQMBAwGBAwGBgQMBAwDCQQMBAwEDAQMBAwDCQQMBAwEDAYEDAMJBAwEDAQMBAwEDAMJBAwEDAQMBgMJBAwEDAQMBAwEDAMJBAwEDAQMAwMJAwkDCQMJAwkCBwMJAwkDCQYEDAQMBAwEDAMJBAwEDAQMBgQMBAwEDAMJBAwEDAQMBgQMBAwDCQQMBAwEDAYEDAMJBAwEDAQMBgMJBAwEDAQMAwMJAwkDCQYEDAQMBgQMBgYEDAQMAwkEDAQMBAwEDAQMBAwDCQQMBAwGBAwDCQQMBAwEDAQMBAwEDAMJBAwEDAYDCQQMBAwEDAQMBAwEDAMJBAwEDAMDCQMJAwkDCQMJAwkDBgMJAwkGBAwEDAQMBAwEDAMJBAwEDAYEDAQMBAwEDAMJBAwEDAYEDAQMBAwDCQQMBAwGBAwEDAMJBAwEDAYEDAMJBAwEDAYDCQQMBAwDAwkDCQYEDAYGBAwEDAMJBAwEDAQMBAwEDAQMAwkEDAQMBgQMAwkEDAQMBAwEDAQMBAwDCQQMBAwGAwkEDAQMBAwEDAQMBAwDCQQMBAwDAwkDCQMJAwkDCQMJAgcDCQMJBgQMBAwEDAQMBAwDCQQMBAwGBAwEDAQMBAwDCQQMBAwGBAwEDAQMAwkEDAQMBgQMBAwDCQQMBAwGBAwDCQQMBAwGAwkEDAQMAwMJAwkGBAwGBgQMBAwDCQQMBAwEDAQMBAwEDAQMAwkEDAYEDAMJBAwEDAQMBAwEDAQMBAwDCQQMBgMJBAwEDAQMBAwEDAQMBAwDCQQMAwMJAwkDCQMJAwkDCQMJAwYDCQYEDAQMBAwEDAQMBAwDCQQMBgQMBAwEDAQMBAwDCQQMBgQMBAwEDAQMAwkEDAYEDAQMBAwDCQQMBgQMBAwDCQQMBgQMAwkEDAYDCQQMAwMJBgYEDAQMAwkEDAQMBAwEDAQMBAwEDAMJBAwGBAwDCQQMBAwEDAQMBAwEDAQMAwkEDAYDCQQMBAwEDAQMBAwEDAQMAwkEDAMDCQMJAwkDCQMJAwkDCQIHAwkGBAwEDAQMBAwEDAQMAwkEDAYEDAQMBAwEDAQMAwkEDAYEDAQMBAwEDAMJBAwGBAwEDAQMAwkEDAYEDAQMAwkEDAYEDAMJBAwGAwkEDAMDCQYGBAwEDAMJBAwEDAQMBAwEDAQMBAwEDAMJBgQMAwkEDAQMBAwEDAQMBAwEDAQMAwkGAwkEDAQMBAwEDAQMBAwEDAQMAwkDAwkDCQMJAwkDCQMJAwkDCQMGBgQMBAwEDAQMBAwEDAQMAwkGBAwEDAQMBAwEDAQMAwkGBAwEDAQMBAwEDAMJBgQMBAwEDAQMAwkGBAwEDAQMAwkGBAwEDAMJBgQMAwkGAwkDBgQMBAwDCQQMBAwEDAQMBAwEDAQMBAwDCQYEDAMJBAwEDAQMBAwEDAQMBAwEDAMJBgMJBAwEDAQMBAwEDAQMBAwEDAMJAwMJAwkDCQMJAwkDCQMJAwkCBwYEDAQMBAwEDAQMBAwEDAMJBgQMBAwEDAQMBAwEDAMJBgQMBAwEDAQMBAwDCQYEDAQMBAwEDAMJBgQMBAwEDAMJBgQMBAwDCQYEDAMJBgMJAwYEDAQMBAwCBgQMBAwEDAQMBAwEDAQMBAwGBAwEDAIGBAwEDAQMBAwEDAQMBAwEDAYEDAIGBAwEDAQMBAwEDAQMBAwEDAYCBgQMBAwEDAQMBAwEDAQMBAwBAgYCBgIGAgYCBgIGAgYCBgYEDAQMBAwEDAQMBAwEDAYEDAQMBAwEDAQMBAwGBAwEDAQMBAwEDAYEDAQMBAwEDAYEDAQMBAwGBAwEDAYEDAYGBAwEDAQMAwkDCQQMBAwEDAQMBAwEDAQMBgQMBAwDCQMJBAwEDAQMBAwEDAQMBAwGBAwDCQMJBAwEDAQMBAwEDAQMBAwGAwkDCQQMBAwEDAQMBAwEDAQMAwMGAwkDCQMJAwkDCQMJAwkDAwkDCQMJAwkDCQMJAwkGBAwEDAQMBAwEDAQMBgQMBAwEDAQMBAwGBAwEDAQMBAwGBAwEDAQMBgQMBAwGBAwGBgQMBAwEDAMJAwkEDAQMBAwEDAQMBAwEDAYEDAQMAwkDCQQMBAwEDAQMBAwEDAQMBgQMAwkDCQQMBAwEDAQMBAwEDAQMBgMJAwkEDAQMBAwEDAQMBAwEDAMCBwMJAwkDCQMJAwkDCQMJAwMJAwkDCQMJAwkDCQMJBgQMBAwEDAQMBAwEDAYEDAQMBAwEDAQMBgQMBAwEDAQMBgQMBAwEDAYEDAQMBgQMBgYEDAQMBAwDCQQMAwkEDAQMBAwEDAQMBAwGBAwEDAMJBAwDCQQMBAwEDAQMBAwEDAYEDAMJBAwDCQQMBAwEDAQMBAwEDAYDCQQMAwkEDAQMBAwEDAQMBAwDAwkDBgMJAwkDCQMJAwkDCQYDCQQMBAwEDAQMBAwEDAMDCQMJAwkDCQMJAwkGBAwEDAQMBAwEDAYEDAQMBAwEDAYEDAQMBAwGBAwEDAYEDAYGBAwEDAQMAwkEDAMJBAwEDAQMBAwEDAQMBgQMBAwDCQQMAwkEDAQMBAwEDAQMBAwGBAwDCQQMAwkEDAQMBAwEDAQMBAwGAwkEDAMJBAwEDAQMBAwEDAQMAwMJAgcDCQMJAwkDCQMJAwkGAwkEDAQMBAwEDAQMBAwDAwkDCQMJAwkDCQMJBgQMBAwEDAQMBAwGBAwEDAQMBAwGBAwEDAQMBgQMBAwGBAwGBgQMBAwEDAMJBAwEDAMJBAwEDAQMBAwEDAYEDAQMAwkEDAQMAwkEDAQMBAwEDAQMBgQMAwkEDAQMAwkEDAQMBAwEDAQMBgMJBAwEDAMJBAwEDAQMBAwEDAMDCQMJAwYDCQMJAwkDCQMJBgQMAwkEDAQMBAwEDAQMBgMJBAwEDAQMBAwEDAMDCQMJAwkDCQMJBgQMBAwEDAQMBgQMBAwEDAYEDAQMBgQMBgYEDAQMBAwDCQQMBAwDCQQMBAwEDAQMBAwGBAwEDAMJBAwEDAMJBAwEDAQMBAwEDAYEDAMJBAwEDAMJBAwEDAQMBAwEDAYDCQQMBAwDCQQMBAwEDAQMBAwDAwkDCQIHAwkDCQMJAwkDCQYEDAMJBAwEDAQMBAwEDAYDCQQMBAwEDAQMBAwDAwkDCQMJAwkDCQYEDAQMBAwEDAYEDAQMBAwGBAwEDAYEDAYGBAwEDAQMAwkEDAQMBAwDCQQMBAwEDAQMBgQMBAwDCQQMBAwEDAMJBAwEDAQMBAwGBAwDCQQMBAwEDAMJBAwEDAQMBAwGAwkEDAQMBAwDCQQMBAwEDAQMAwMJAwkDCQMGAwkDCQMJAwkGBAwEDAMJBAwEDAQMBAwGBAwDCQQMBAwEDAQMBgMJBAwEDAQMBAwDAwkDCQMJAwkGBAwEDAQMBgQMBAwGBAwGBgQMBAwEDAMJBAwEDAQMAwkEDAQMBAwEDAYEDAQMAwkEDAQMBAwDCQQMBAwEDAQMBgQMAwkEDAQMBAwDCQQMBAwEDAQMBgMJBAwEDAQMAwkEDAQMBAwEDAMDCQMJAwkCBwMJAwkDCQMJBgQMBAwDCQQMBAwEDAQMBgQMAwkEDAQMBAwEDAYDCQQMBAwEDAQMAwMJAwkDCQMJBgQMBAwEDAYEDAQMBgQMBgYEDAQMBAwDCQQMBAwEDAQMAwkEDAQMBAwGBAwEDAMJBAwEDAQMBAwDCQQMBAwEDAYEDAMJBAwEDAQMBAwDCQQMBAwEDAYDCQQMBAwEDAQMAwkEDAQMBAwDAwkDCQMJAwkDBgMJAwkDCQYEDAQMBAwDCQQMBAwEDAYEDAQMAwkEDAQMBAwGBAwDCQQMBAwEDAYDCQQMBAwEDAMDCQMJAwkGBAwEDAYEDAYGBAwEDAQMAwkEDAQMBAwEDAMJBAwEDAQMBgQMBAwDCQQMBAwEDAQMAwkEDAQMBAwGBAwDCQQMBAwEDAQMAwkEDAQMBAwGAwkEDAQMBAwEDAMJBAwEDAQMAwMJAwkDCQMJAgcDCQMJAwkGBAwEDAQMAwkEDAQMBAwGBAwEDAMJBAwEDAQMBgQMAwkEDAQMBAwGAwkEDAQMBAwDAwkDCQMJBgQMBAwGBAwGBgQMBAwEDAMJBAwEDAQMBAwEDAMJBAwEDAYEDAQMAwkEDAQMBAwEDAQMAwkEDAQMBgQMAwkEDAQMBAwEDAQMAwkEDAQMBgMJBAwEDAQMBAwEDAMJBAwEDAMDCQMJAwkDCQMJAwYDCQMJBgQMBAwEDAQMAwkEDAQMBgQMBAwEDAMJBAwEDAYEDAQMAwkEDAQMBgQMAwkEDAQMBgMJBAwEDAMDCQMJBgQMBgYEDAQMBAwDCQQMBAwEDAQMBAwDCQQMBAwGBAwEDAMJBAwEDAQMBAwEDAMJBAwEDAYEDAMJBAwEDAQMBAwEDAMJBAwEDAYDCQQMBAwEDAQMBAwDCQQMBAwDAwkDCQMJAwkDCQIHAwkDCQYEDAQMBAwEDAMJBAwEDAYEDAQMBAwDCQQMBAwGBAwEDAMJBAwEDAYEDAMJBAwEDAYDCQQMBAwDAwkDCQYEDAYGBAwEDAQMAwkEDAQMBAwEDAQMBAwDCQQMBgQMBAwDCQQMBAwEDAQMBAwEDAMJBAwGBAwDCQQMBAwEDAQMBAwEDAMJBAwGAwkEDAQMBAwEDAQMBAwDCQQMAwMJAwkDCQMJAwkDCQMGAwkGBAwEDAQMBAwEDAMJBAwGBAwEDAQMBAwDCQQMBgQMBAwEDAMJBAwGBAwEDAMJBAwGBAwDCQQMBgMJBAwDAwkGBgQMBAwEDAMJBAwEDAQMBAwEDAQMAwkEDAYEDAQMAwkEDAQMBAwEDAQMBAwDCQQMBgQMAwkEDAQMBAwEDAQMBAwDCQQMBgMJBAwEDAQMBAwEDAQMAwkEDAMDCQMJAwkDCQMJAwkCBwMJBgQMBAwEDAQMBAwDCQQMBgQMBAwEDAQMAwkEDAYEDAQMBAwDCQQMBgQMBAwDCQQMBgQMAwkEDAYDCQQMAwMJBgYEDAQMBAwDCQQMBAwEDAQMBAwEDAQMAwkGBAwEDAMJBAwEDAQMBAwEDAQMBAwDCQYEDAMJBAwEDAQMBAwEDAQMBAwDCQYDCQQMBAwEDAQMBAwEDAQMAwkDAwkDCQMJAwkDCQMJAwkDBgYEDAQMBAwEDAQMBAwDCQYEDAQMBAwEDAQMAwkGBAwEDAQMBAwDCQYEDAQMBAwDCQYEDAQMAwkGBAwDCQYDCQMGBAwEDAQMAwkEDAQMBAwEDAQMBAwEDAMJBgQMBAwDCQQMBAwEDAQMBAwEDAQMAwkGBAwDCQQMBAwEDAQMBAwEDAQMAwkGAwkEDAQMBAwEDAQMBAwEDAMJAwMJAwkDCQMJAwkDCQMJAgcGBAwEDAQMBAwEDAQMAwkGBAwEDAQMBAwEDAMJBgQMBAwEDAQMAwkGBAwEDAQMAwkGBAwEDAMJBgQMAwkGAwkDBgQMBAwEDAQMAgYEDAQMBAwEDAQMBAwEDAYEDAQMBAwCBgQMBAwEDAQMBAwEDAQMBgQMBAwCBgQMBAwEDAQMBAwEDAQMBgQMAgYEDAQMBAwEDAQMBAwEDAYCBgQMBAwEDAQMBAwEDAQMAQIGAgYCBgIGAgYCBgIGBgQMBAwEDAQMBAwEDAYEDAQMBAwEDAQMBgQMBAwEDAQMBgQMBAwEDAYEDAQMBgQMBgYEDAQMBAwEDAMJAwkEDAQMBAwEDAQMBAwGBAwEDAQMAwkDCQQMBAwEDAQMBAwEDAYEDAQMAwkDCQQMBAwEDAQMBAwEDAYEDAMJAwkEDAQMBAwEDAQMBAwGAwkDCQQMBAwEDAQMBAwEDAMDBgMJAwkDCQMJAwkDCQMDCQMJAwkDCQMJAwkGBAwEDAQMBAwEDAYEDAQMBAwEDAYEDAQMBAwGBAwEDAYEDAYGBAwEDAQMBAwDCQMJBAwEDAQMBAwEDAQMBgQMBAwEDAMJAwkEDAQMBAwEDAQMBAwGBAwEDAMJAwkEDAQMBAwEDAQMBAwGBAwDCQMJBAwEDAQMBAwEDAQMBgMJAwkEDAQMBAwEDAQMBAwDAgcDCQMJAwkDCQMJAwkDAwkDCQMJAwkDCQMJBgQMBAwEDAQMBAwGBAwEDAQMBAwGBAwEDAQMBgQMBAwGBAwGBgQMBAwEDAQMAwkEDAMJBAwEDAQMBAwEDAYEDAQMBAwDCQQMAwkEDAQMBAwEDAQMBgQMBAwDCQQMAwkEDAQMBAwEDAQMBgQMAwkEDAMJBAwEDAQMBAwEDAYDCQQMAwkEDAQMBAwEDAQMAwMJAwYDCQMJAwkDCQMJBgMJBAwEDAQMBAwEDAMDCQMJAwkDCQMJBgQMBAwEDAQMBgQMBAwEDAYEDAQMBgQMBgYEDAQMBAwEDAMJBAwDCQQMBAwEDAQMBAwGBAwEDAQMAwkEDAMJBAwEDAQMBAwEDAYEDAQMAwkEDAMJBAwEDAQMBAwEDAYEDAMJBAwDCQQMBAwEDAQMBAwGAwkEDAMJBAwEDAQMBAwEDAMDCQIHAwkDCQMJAwkDCQYDCQQMBAwEDAQMBAwDAwkDCQMJAwkDCQYEDAQMBAwEDAYEDAQMBAwGBAwEDAYEDAYGBAwEDAQMBAwDCQQMBAwDCQQMBAwEDAQMBgQMBAwEDAMJBAwEDAMJBAwEDAQMBAwGBAwEDAMJBAwEDAMJBAwEDAQMBAwGBAwDCQQMBAwDCQQMBAwEDAQMBgMJBAwEDAMJBAwEDAQMBAwDAwkDCQMGAwkDCQMJAwkGBAwDCQQMBAwEDAQMBgMJBAwEDAQMBAwDAwkDCQMJAwkGBAwEDAQMBgQMBAwGBAwGBgQMBAwEDAQMAwkEDAQMAwkEDAQMBAwEDAYEDAQMBAwDCQQMBAwDCQQMBAwEDAQMBgQMBAwDCQQMBAwDCQQMBAwEDAQMBgQMAwkEDAQMAwkEDAQMBAwEDAYDCQQMBAwDCQQMBAwEDAQMAwMJAwkCBwMJAwkDCQMJBgQMAwkEDAQMBAwEDAYDCQQMBAwEDAQMAwMJAwkDCQMJBgQMBAwEDAYEDAQMBgQMBgYEDAQMBAwEDAMJBAwEDAQMAwkEDAQMBAwGBAwEDAQMAwkEDAQMBAwDCQQMBAwEDAYEDAQMAwkEDAQMBAwDCQQMBAwEDAYEDAMJBAwEDAQMAwkEDAQMBAwGAwkEDAQMBAwDCQQMBAwEDAMDCQMJAwkDBgMJAwkDCQYEDAQMAwkEDAQMBAwGBAwDCQQMBAwEDAYDCQQMBAwEDAMDCQMJAwkGBAwEDAYEDAYGBAwEDAQMBAwDCQQMBAwEDAMJBAwEDAQMBgQMBAwEDAMJBAwEDAQMAwkEDAQMBAwGBAwEDAMJBAwEDAQMAwkEDAQMBAwGBAwDCQQMBAwEDAMJBAwEDAQMBgMJBAwEDAQMAwkEDAQMBAwDAwkDCQMJAgcDCQMJAwkGBAwEDAMJBAwEDAQMBgQMAwkEDAQMBAwGAwkEDAQMBAwDAwkDCQMJBgQMBAwGBAwGBgQMBAwEDAQMAwkEDAQMBAwEDAMJBAwEDAYEDAQMBAwDCQQMBAwEDAQMAwkEDAQMBgQMBAwDCQQMBAwEDAQMAwkEDAQMBgQMAwkEDAQMBAwEDAMJBAwEDAYDCQQMBAwEDAQMAwkEDAQMAwMJAwkDCQMJAwYDCQMJBgQMBAwEDAMJBAwEDAYEDAQMAwkEDAQMBgQMAwkEDAQMBgMJBAwEDAMDCQMJBgQMBgYEDAQMBAwEDAMJBAwEDAQMBAwDCQQMBAwGBAwEDAQMAwkEDAQMBAwEDAMJBAwEDAYEDAQMAwkEDAQMBAwEDAMJBAwEDAYEDAMJBAwEDAQMBAwDCQQMBAwGAwkEDAQMBAwEDAMJBAwEDAMDCQMJAwkDCQIHAwkDCQYEDAQMBAwDCQQMBAwGBAwEDAMJBAwEDAYEDAMJBAwEDAYDCQQMBAwDAwkDCQYEDAYGBAwEDAQMBAwDCQQMBAwEDAQMBAwDCQQMBgQMBAwEDAMJBAwEDAQMBAwEDAMJBAwGBAwEDAMJBAwEDAQMBAwEDAMJBAwGBAwDCQQMBAwEDAQMBAwDCQQMBgMJBAwEDAQMBAwEDAMJBAwDAwkDCQMJAwkDCQMGAwkGBAwEDAQMBAwDCQQMBgQMBAwEDAMJBAwGBAwEDAMJBAwGBAwDCQQMBgMJBAwDAwkGBgQMBAwEDAQMAwkEDAQMBAwEDAQMAwkEDAYEDAQMBAwDCQQMBAwEDAQMBAwDCQQMBgQMBAwDCQQMBAwEDAQMBAwDCQQMBgQMAwkEDAQMBAwEDAQMAwkEDAYDCQQMBAwEDAQMBAwDCQQMAwMJAwkDCQMJAwkCBwMJBgQMBAwEDAQMAwkEDAYEDAQMBAwDCQQMBgQMBAwDCQQMBgQMAwkEDAYDCQQMAwMJBgYEDAQMBAwEDAMJBAwEDAQMBAwEDAQMAwkGBAwEDAQMAwkEDAQMBAwEDAQMBAwDCQYEDAQMAwkEDAQMBAwEDAQMBAwDCQYEDAMJBAwEDAQMBAwEDAQMAwkGAwkEDAQMBAwEDAQMBAwDCQMDCQMJAwkDCQMJAwkDBgYEDAQMBAwEDAQMAwkGBAwEDAQMBAwDCQYEDAQMBAwDCQYEDAQMAwkGBAwDCQYDCQMGBAwEDAQMBAwDCQQMBAwEDAQMBAwEDAMJBgQMBAwEDAMJBAwEDAQMBAwEDAQMAwkGBAwEDAMJBAwEDAQMBAwEDAQMAwkGBAwDCQQMBAwEDAQMBAwEDAMJBgMJBAwEDAQMBAwEDAQMAwkDAwkDCQMJAwkDCQMJAgcGBAwEDAQMBAwEDAMJBgQMBAwEDAQMAwkGBAwEDAQMAwkGBAwEDAMJBgQMAwkGAwkDBgQMBAwEDAQMBAwCBgQMBAwEDAQMBAwEDAYEDAQMBAwEDAIGBAwEDAQMBAwEDAQMBgQMBAwEDAIGBAwEDAQMBAwEDAQMBgQMBAwCBgQMBAwEDAQMBAwEDAYEDAIGBAwEDAQMBAwEDAQMBgIGBAwEDAQMBAwEDAQMAQIGAgYCBgIGAgYCBgYEDAQMBAwEDAQMBgQMBAwEDAQMBgQMBAwEDAYEDAQMBgQMBgYEDAQMBAwEDAQMAwkDCQQMBAwEDAQMBAwGBAwEDAQMBAwDCQMJBAwEDAQMBAwEDAYEDAQMBAwDCQMJBAwEDAQMBAwEDAYEDAQMAwkDCQQMBAwEDAQMBAwGBAwDCQMJBAwEDAQMBAwEDAYDCQMJBAwEDAQMBAwEDAMDBgMJAwkDCQMJAwkDAwkDCQMJAwkDCQYEDAQMBAwEDAYEDAQMBAwGBAwEDAYEDAYGBAwEDAQMBAwEDAMJAwkEDAQMBAwEDAQMBgQMBAwEDAQMAwkDCQQMBAwEDAQMBAwGBAwEDAQMAwkDCQQMBAwEDAQMBAwGBAwEDAMJAwkEDAQMBAwEDAQMBgQMAwkDCQQMBAwEDAQMBAwGAwkDCQQMBAwEDAQMBAwDAgcDCQMJAwkDCQMJAwMJAwkDCQMJAwkGBAwEDAQMBAwGBAwEDAQMBgQMBAwGBAwGBgQMBAwEDAQMBAwDCQQMAwkEDAQMBAwEDAYEDAQMBAwEDAMJBAwDCQQMBAwEDAQMBgQMBAwEDAMJBAwDCQQMBAwEDAQMBgQMBAwDCQQMAwkEDAQMBAwEDAYEDAMJBAwDCQQMBAwEDAQMBgMJBAwDCQQMBAwEDAQMAwMJAwYDCQMJAwkDCQYDCQQMBAwEDAQMAwMJAwkDCQMJBgQMBAwEDAYEDAQMBgQMBgYEDAQMBAwEDAQMAwkEDAMJBAwEDAQMBAwGBAwEDAQMBAwDCQQMAwkEDAQMBAwEDAYEDAQMBAwDCQQMAwkEDAQMBAwEDAYEDAQMAwkEDAMJBAwEDAQMBAwGBAwDCQQMAwkEDAQMBAwEDAYDCQQMAwkEDAQMBAwEDAMDCQIHAwkDCQMJAwkGAwkEDAQMBAwEDAMDCQMJAwkDCQYEDAQMBAwGBAwEDAYEDAYGBAwEDAQMBAwEDAMJBAwEDAMJBAwEDAQMBgQMBAwEDAQMAwkEDAQMAwkEDAQMBAwGBAwEDAQMAwkEDAQMAwkEDAQMBAwGBAwEDAMJBAwEDAMJBAwEDAQMBgQMAwkEDAQMAwkEDAQMBAwGAwkEDAQMAwkEDAQMBAwDAwkDCQMGAwkDCQMJBgQMAwkEDAQMBAwGAwkEDAQMBAwDAwkDCQMJBgQMBAwGBAwGBgQMBAwEDAQMBAwDCQQMBAwDCQQMBAwEDAYEDAQMBAwEDAMJBAwEDAMJBAwEDAQMBgQMBAwEDAMJBAwEDAMJBAwEDAQMBgQMBAwDCQQMBAwDCQQMBAwEDAYEDAMJBAwEDAMJBAwEDAQMBgMJBAwEDAMJBAwEDAQMAwMJAwkCBwMJAwkDCQYEDAMJBAwEDAQMBgMJBAwEDAQMAwMJAwkDCQYEDAQMBgQMBgYEDAQMBAwEDAQMAwkEDAQMBAwDCQQMBAwGBAwEDAQMBAwDCQQMBAwEDAMJBAwEDAYEDAQMBAwDCQQMBAwEDAMJBAwEDAYEDAQMAwkEDAQMBAwDCQQMBAwGBAwDCQQMBAwEDAMJBAwEDAYDCQQMBAwEDAMJBAwEDAMDCQMJAwkDBgMJAwkGBAwEDAMJBAwEDAYEDAMJBAwEDAYDCQQMBAwDAwkDCQYEDAYGBAwEDAQMBAwEDAMJBAwEDAQMAwkEDAQMBgQMBAwEDAQMAwkEDAQMBAwDCQQMBAwGBAwEDAQMAwkEDAQMBAwDCQQMBAwGBAwEDAMJBAwEDAQMAwkEDAQMBgQMAwkEDAQMBAwDCQQMBAwGAwkEDAQMBAwDCQQMBAwDAwkDCQMJAgcDCQMJBgQMBAwDCQQMBAwGBAwDCQQMBAwGAwkEDAQMAwMJAwkGBAwGBgQMBAwEDAQMBAwDCQQMBAwEDAQMAwkEDAYEDAQMBAwEDAMJBAwEDAQMBAwDCQQMBgQMBAwEDAMJBAwEDAQMBAwDCQQMBgQMBAwDCQQMBAwEDAQMAwkEDAYEDAMJBAwEDAQMBAwDCQQMBgMJBAwEDAQMBAwDCQQMAwMJAwkDCQMJAwYDCQYEDAQMBAwDCQQMBgQMBAwDCQQMBgQMAwkEDAYDCQQMAwMJBgYEDAQMBAwEDAQMAwkEDAQMBAwEDAMJBAwGBAwEDAQMBAwDCQQMBAwEDAQMAwkEDAYEDAQMBAwDCQQMBAwEDAQMAwkEDAYEDAQMAwkEDAQMBAwEDAMJBAwGBAwDCQQMBAwEDAQMAwkEDAYDCQQMBAwEDAQMAwkEDAMDCQMJAwkDCQIHAwkGBAwEDAQMAwkEDAYEDAQMAwkEDAYEDAMJBAwGAwkEDAMDCQYGBAwEDAQMBAwEDAMJBAwEDAQMBAwEDAMJBgQMBAwEDAQMAwkEDAQMBAwEDAQMAwkGBAwEDAQMAwkEDAQMBAwEDAQMAwkGBAwEDAMJBAwEDAQMBAwEDAMJBgQMAwkEDAQMBAwEDAQMAwkGAwkEDAQMBAwEDAQMAwkDAwkDCQMJAwkDCQMGBgQMBAwEDAQMAwkGBAwEDAQMAwkGBAwEDAMJBgQMAwkGAwkDBgQMBAwEDAQMBAwDCQQMBAwEDAQMBAwDCQYEDAQMBAwEDAMJBAwEDAQMBAwEDAMJBgQMBAwEDAMJBAwEDAQMBAwEDAMJBgQMBAwDCQQMBAwEDAQMBAwDCQYEDAMJBAwEDAQMBAwEDAMJBgMJBAwEDAQMBAwEDAMJAwMJAwkDCQMJAwkCBwYEDAQMBAwEDAMJBgQMBAwEDAMJBgQMBAwDCQYEDAMJBgMJAwYEDAQMBAwEDAQMBAwCBgQMBAwEDAQMBAwGBAwEDAQMBAwEDAIGBAwEDAQMBAwEDAYEDAQMBAwEDAIGBAwEDAQMBAwEDAYEDAQMBAwCBgQMBAwEDAQMBAwGBAwEDAIGBAwEDAQMBAwEDAYEDAIGBAwEDAQMBAwEDAYCBgQMBAwEDAQMBAwBAgYCBgIGAgYCBgYEDAQMBAwEDAYEDAQMBAwGBAwEDAYEDAYGBAwEDAQMBAwEDAQMAwkDCQQMBAwEDAQMBgQMBAwEDAQMBAwDCQMJBAwEDAQMBAwGBAwEDAQMBAwDCQMJBAwEDAQMBAwGBAwEDAQMAwkDCQQMBAwEDAQMBgQMBAwDCQMJBAwEDAQMBAwGBAwDCQMJBAwEDAQMBAwGAwkDCQQMBAwEDAQMAwMGAwkDCQMJAwkDAwkDCQMJAwkGBAwEDAQMBgQMBAwGBAwGBgQMBAwEDAQMBAwEDAMJAwkEDAQMBAwEDAYEDAQMBAwEDAQMAwkDCQQMBAwEDAQMBgQMBAwEDAQMAwkDCQQMBAwEDAQMBgQMBAwEDAMJAwkEDAQMBAwEDAYEDAQMAwkDCQQMBAwEDAQMBgQMAwkDCQQMBAwEDAQMBgMJAwkEDAQMBAwEDAMCBwMJAwkDCQMJAwMJAwkDCQMJBgQMBAwEDAYEDAQMBgQMBgYEDAQMBAwEDAQMBAwDCQQMAwkEDAQMBAwGBAwEDAQMBAwEDAMJBAwDCQQMBAwEDAYEDAQMBAwEDAMJBAwDCQQMBAwEDAYEDAQMBAwDCQQMAwkEDAQMBAwGBAwEDAMJBAwDCQQMBAwEDAYEDAMJBAwDCQQMBAwEDAYDCQQMAwkEDAQMBAwDAwkDBgMJAwkDCQYDCQQMBAwEDAMDCQMJAwkGBAwEDAYEDAYGBAwEDAQMBAwEDAQMAwkEDAMJBAwEDAQMBgQMBAwEDAQMBAwDCQQMAwkEDAQMBAwGBAwEDAQMBAwDCQQMAwkEDAQMBAwGBAwEDAQMAwkEDAMJBAwEDAQMBgQMBAwDCQQMAwkEDAQMBAwGBAwDCQQMAwkEDAQMBAwGAwkEDAMJBAwEDAQMAwMJAgcDCQMJAwkGAwkEDAQMBAwDAwkDCQMJBgQMBAwGBAwGBgQMBAwEDAQMBAwEDAMJBAwEDAMJBAwEDAYEDAQMBAwEDAQMAwkEDAQMAwkEDAQMBgQMBAwEDAQMAwkEDAQMAwkEDAQMBgQMBAwEDAMJBAwEDAMJBAwEDAYEDAQMAwkEDAQMAwkEDAQMBgQMAwkEDAQMAwkEDAQMBgMJBAwEDAMJBAwEDAMDCQMJAwYDCQMJBgQMAwkEDAQMBgMJBAwEDAMDCQMJBgQMBgYEDAQMBAwEDAQMBAwDCQQMBAwDCQQMBAwGBAwEDAQMBAwEDAMJBAwEDAMJBAwEDAYEDAQMBAwEDAMJBAwEDAMJBAwEDAYEDAQMBAwDCQQMBAwDCQQMBAwGBAwEDAMJBAwEDAMJBAwEDAYEDAMJBAwEDAMJBAwEDAYDCQQMBAwDCQQMBAwDAwkDCQIHAwkDCQYEDAMJBAwEDAYDCQQMBAwDAwkDCQYEDAYGBAwEDAQMBAwEDAQMAwkEDAQMBAwDCQQMBgQMBAwEDAQMBAwDCQQMBAwEDAMJBAwGBAwEDAQMBAwDCQQMBAwEDAMJBAwGBAwEDAQMAwkEDAQMBAwDCQQMBgQMBAwDCQQMBAwEDAMJBAwGBAwDCQQMBAwEDAMJBAwGAwkEDAQMBAwDCQQMAwMJAwkDCQMGAwkGBAwEDAMJBAwGBAwDCQQMBgMJBAwDAwkGBgQMBAwEDAQMBAwEDAMJBAwEDAQMAwkEDAYEDAQMBAwEDAQMAwkEDAQMBAwDCQQMBgQMBAwEDAQMAwkEDAQMBAwDCQQMBgQMBAwEDAMJBAwEDAQMAwkEDAYEDAQMAwkEDAQMBAwDCQQMBgQMAwkEDAQMBAwDCQQMBgMJBAwEDAQMAwkEDAMDCQMJAwkCBwMJBgQMBAwDCQQMBgQMAwkEDAYDCQQMAwMJBgYEDAQMBAwEDAQMBAwDCQQMBAwEDAQMAwkGBAwEDAQMBAwEDAMJBAwEDAQMBAwDCQYEDAQMBAwEDAMJBAwEDAQMBAwDCQYEDAQMBAwDCQQMBAwEDAQMAwkGBAwEDAMJBAwEDAQMBAwDCQYEDAMJBAwEDAQMBAwDCQYDCQQMBAwEDAQMAwkDAwkDCQMJAwkDBgYEDAQMBAwDCQYEDAQMAwkGBAwDCQYDCQMGBAwEDAQMBAwEDAQMAwkEDAQMBAwEDAMJBgQMBAwEDAQMBAwDCQQMBAwEDAQMAwkGBAwEDAQMBAwDCQQMBAwEDAQMAwkGBAwEDAQMAwkEDAQMBAwEDAMJBgQMBAwDCQQMBAwEDAQMAwkGBAwDCQQMBAwEDAQMAwkGAwkEDAQMBAwEDAMJAwMJAwkDCQMJAgcGBAwEDAQMAwkGBAwEDAMJBgQMAwkGAwkDBgQMBAwEDAQMBAwEDAQMAgYEDAQMBAwEDAYEDAQMBAwEDAQMBAwCBgQMBAwEDAQMBgQMBAwEDAQMBAwCBgQMBAwEDAQMBgQMBAwEDAQMAgYEDAQMBAwEDAYEDAQMBAwCBgQMBAwEDAQMBgQMBAwCBgQMBAwEDAQMBgQMAgYEDAQMBAwEDAYCBgQMBAwEDAQMAQIGAgYCBgIGBgQMBAwEDAYEDAQMBgQMBgYEDAQMBAwEDAQMBAwEDAMJAwkEDAQMBAwGBAwEDAQMBAwEDAQMAwkDCQQMBAwEDAYEDAQMBAwEDAQMAwkDCQQMBAwEDAYEDAQMBAwEDAMJAwkEDAQMBAwGBAwEDAQMAwkDCQQMBAwEDAYEDAQMAwkDCQQMBAwEDAYEDAMJAwkEDAQMBAwGAwkDCQQMBAwEDAMDBgMJAwkDCQMDCQMJAwkGBAwEDAYEDAYGBAwEDAQMBAwEDAQMBAwDCQMJBAwEDAQMBgQMBAwEDAQMBAwEDAMJAwkEDAQMBAwGBAwEDAQMBAwEDAMJAwkEDAQMBAwGBAwEDAQMBAwDCQMJBAwEDAQMBgQMBAwEDAMJAwkEDAQMBAwGBAwEDAMJAwkEDAQMBAwGBAwDCQMJBAwEDAQMBgMJAwkEDAQMBAwDAgcDCQMJAwkDAwkDCQMJBgQMBAwGBAwGBgQMBAwEDAQMBAwEDAQMAwkEDAMJBAwEDAYEDAQMBAwEDAQMBAwDCQQMAwkEDAQMBgQMBAwEDAQMBAwDCQQMAwkEDAQMBgQMBAwEDAQMAwkEDAMJBAwEDAYEDAQMBAwDCQQMAwkEDAQMBgQMBAwDCQQMAwkEDAQMBgQMAwkEDAMJBAwEDAYDCQQMAwkEDAQMAwMJAwYDCQMJBgMJBAwEDAMDCQMJBgQMBgYEDAQMBAwEDAQMBAwEDAMJBAwDCQQMBAwGBAwEDAQMBAwEDAQMAwkEDAMJBAwEDAYEDAQMBAwEDAQMAwkEDAMJBAwEDAYEDAQMBAwEDAMJBAwDCQQMBAwGBAwEDAQMAwkEDAMJBAwEDAYEDAQMAwkEDAMJBAwEDAYEDAMJBAwDCQQMBAwGAwkEDAMJBAwEDAMDCQIHAwkDCQYDCQQMBAwDAwkDCQYEDAYGBAwEDAQMBAwEDAQMBAwDCQQMBAwDCQQMBgQMBAwEDAQMBAwEDAMJBAwEDAMJBAwGBAwEDAQMBAwEDAMJBAwEDAMJBAwGBAwEDAQMBAwDCQQMBAwDCQQMBgQMBAwEDAMJBAwEDAMJBAwGBAwEDAMJBAwEDAMJBAwGBAwDCQQMBAwDCQQMBgMJBAwEDAMJBAwDAwkDCQMGAwkGBAwDCQQMBgMJBAwDAwkGBgQMBAwEDAQMBAwEDAQMAwkEDAQMAwkEDAYEDAQMBAwEDAQMBAwDCQQMBAwDCQQMBgQMBAwEDAQMBAwDCQQMBAwDCQQMBgQMBAwEDAQMAwkEDAQMAwkEDAYEDAQMBAwDCQQMBAwDCQQMBgQMBAwDCQQMBAwDCQQMBgQMAwkEDAQMAwkEDAYDCQQMBAwDCQQMAwMJAwkCBwMJBgQMAwkEDAYDCQQMAwMJBgYEDAQMBAwEDAQMBAwEDAMJBAwEDAQMAwkGBAwEDAQMBAwEDAQMAwkEDAQMBAwDCQYEDAQMBAwEDAQMAwkEDAQMBAwDCQYEDAQMBAwEDAMJBAwEDAQMAwkGBAwEDAQMAwkEDAQMBAwDCQYEDAQMAwkEDAQMBAwDCQYEDAMJBAwEDAQMAwkGAwkEDAQMBAwDCQMDCQMJAwkDBgYEDAQMAwkGBAwDCQYDCQMGBAwEDAQMBAwEDAQMBAwDCQQMBAwEDAMJBgQMBAwEDAQMBAwEDAMJBAwEDAQMAwkGBAwEDAQMBAwEDAMJBAwEDAQMAwkGBAwEDAQMBAwDCQQMBAwEDAMJBgQMBAwEDAMJBAwEDAQMAwkGBAwEDAMJBAwEDAQMAwkGBAwDCQQMBAwEDAMJBgMJBAwEDAQMAwkDAwkDCQMJAgcGBAwEDAMJBgQMAwkGAwkDBgQMBAwEDAQMBAwEDAQMBAwCBgQMBAwEDAYEDAQMBAwEDAQMBAwEDAIGBAwEDAQMBgQMBAwEDAQMBAwEDAIGBAwEDAQMBgQMBAwEDAQMBAwCBgQMBAwEDAYEDAQMBAwEDAIGBAwEDAQMBgQMBAwEDAIGBAwEDAQMBgQMBAwCBgQMBAwEDAYEDAIGBAwEDAQMBgIGBAwEDAQMAQIGAgYCBgYEDAQMBgQMBgYEDAQMBAwEDAQMBAwEDAQMAwkDCQQMBAwGBAwEDAQMBAwEDAQMBAwDCQMJBAwEDAYEDAQMBAwEDAQMBAwDCQMJBAwEDAYEDAQMBAwEDAQMAwkDCQQMBAwGBAwEDAQMBAwDCQMJBAwEDAYEDAQMBAwDCQMJBAwEDAYEDAQMAwkDCQQMBAwGBAwDCQMJBAwEDAYDCQMJBAwEDAMDBgMJAwkDAwkDCQYEDAYGBAwEDAQMBAwEDAQMBAwEDAMJAwkEDAQMBgQMBAwEDAQMBAwEDAQMAwkDCQQMBAwGBAwEDAQMBAwEDAQMAwkDCQQMBAwGBAwEDAQMBAwEDAMJAwkEDAQMBgQMBAwEDAQMAwkDCQQMBAwGBAwEDAQMAwkDCQQMBAwGBAwEDAMJAwkEDAQMBgQMAwkDCQQMBAwGAwkDCQQMBAwDAgcDCQMJAwMJAwkGBAwGBgQMBAwEDAQMBAwEDAQMBAwDCQQMAwkEDAYEDAQMBAwEDAQMBAwEDAMJBAwDCQQMBgQMBAwEDAQMBAwEDAMJBAwDCQQMBgQMBAwEDAQMBAwDCQQMAwkEDAYEDAQMBAwEDAMJBAwDCQQMBgQMBAwEDAMJBAwDCQQMBgQMBAwDCQQMAwkEDAYEDAMJBAwDCQQMBgMJBAwDCQQMAwMJAwYDCQYDCQQMAwMJBgYEDAQMBAwEDAQMBAwEDAQMAwkEDAMJBAwGBAwEDAQMBAwEDAQMBAwDCQQMAwkEDAYEDAQMBAwEDAQMBAwDCQQMAwkEDAYEDAQMBAwEDAQMAwkEDAMJBAwGBAwEDAQMBAwDCQQMAwkEDAYEDAQMBAwDCQQMAwkEDAYEDAQMAwkEDAMJBAwGBAwDCQQMAwkEDAYDCQQMAwkEDAMDCQIHAwkGAwkEDAMDCQYGBAwEDAQMBAwEDAQMBAwEDAMJBAwEDAMJBgQMBAwEDAQMBAwEDAQMAwkEDAQMAwkGBAwEDAQMBAwEDAQMAwkEDAQMAwkGBAwEDAQMBAwEDAMJBAwEDAMJBgQMBAwEDAQMAwkEDAQMAwkGBAwEDAQMAwkEDAQMAwkGBAwEDAMJBAwEDAMJBgQMAwkEDAQMAwkGAwkEDAQMAwkDAwkDCQMGBgQMAwkGAwkDBgQMBAwEDAQMBAwEDAQMBAwDCQQMBAwDCQYEDAQMBAwEDAQMBAwEDAMJBAwEDAMJBgQMBAwEDAQMBAwEDAMJBAwEDAMJBgQMBAwEDAQMBAwDCQQMBAwDCQYEDAQMBAwEDAMJBAwEDAMJBgQMBAwEDAMJBAwEDAMJBgQMBAwDCQQMBAwDCQYEDAMJBAwEDAMJBgMJBAwEDAMJAwMJAwkCBwYEDAMJBgMJAwYEDAQMBAwEDAQMBAwEDAQMBAwCBgQMBAwGBAwEDAQMBAwEDAQMBAwEDAIGBAwEDAYEDAQMBAwEDAQMBAwEDAIGBAwEDAYEDAQMBAwEDAQMBAwCBgQMBAwGBAwEDAQMBAwEDAIGBAwEDAYEDAQMBAwEDAIGBAwEDAYEDAQMBAwCBgQMBAwGBAwEDAIGBAwEDAYEDAIGBAwEDAYCBgQMBAwBAgYCBgYEDAYGBAwEDAQMBAwEDAQMBAwEDAQMAwkDCQQMBgQMBAwEDAQMBAwEDAQMBAwDCQMJBAwGBAwEDAQMBAwEDAQMBAwDCQMJBAwGBAwEDAQMBAwEDAQMAwkDCQQMBgQMBAwEDAQMBAwDCQMJBAwGBAwEDAQMBAwDCQMJBAwGBAwEDAQMAwkDCQQMBgQMBAwDCQMJBAwGBAwDCQMJBAwGAwkDCQQMAwMGAwkDAwkGBgQMBAwEDAQMBAwEDAQMBAwEDAMJAwkEDAYEDAQMBAwEDAQMBAwEDAQMAwkDCQQMBgQMBAwEDAQMBAwEDAQMAwkDCQQMBgQMBAwEDAQMBAwEDAMJAwkEDAYEDAQMBAwEDAQMAwkDCQQMBgQMBAwEDAQMAwkDCQQMBgQMBAwEDAMJAwkEDAYEDAQMAwkDCQQMBgQMAwkDCQQMBgMJAwkEDAMCBwMJAwMJBgYEDAQMBAwEDAQMBAwEDAQMBAwDCQQMAwkGBAwEDAQMBAwEDAQMBAwEDAMJBAwDCQYEDAQMBAwEDAQMBAwEDAMJBAwDCQYEDAQMBAwEDAQMBAwDCQQMAwkGBAwEDAQMBAwEDAMJBAwDCQYEDAQMBAwEDAMJBAwDCQYEDAQMBAwDCQQMAwkGBAwEDAMJBAwDCQYEDAMJBAwDCQYDCQQMAwkDAwkDBgYDCQMGBAwEDAQMBAwEDAQMBAwEDAQMAwkEDAMJBgQMBAwEDAQMBAwEDAQMBAwDCQQMAwkGBAwEDAQMBAwEDAQMBAwDCQQMAwkGBAwEDAQMBAwEDAQMAwkEDAMJBgQMBAwEDAQMBAwDCQQMAwkGBAwEDAQMBAwDCQQMAwkGBAwEDAQMAwkEDAMJBgQMBAwDCQQMAwkGBAwDCQQMAwkGAwkEDAMJAwMJAgcGAwkDBgQMBAwEDAQMBAwEDAQMBAwEDAQMAgYEDAYEDAQMBAwEDAQMBAwEDAQMBAwCBgQMBgQMBAwEDAQMBAwEDAQMBAwCBgQMBgQMBAwEDAQMBAwEDAQMAgYEDAYEDAQMBAwEDAQMBAwCBgQMBgQMBAwEDAQMBAwCBgQMBgQMBAwEDAQMAgYEDAYEDAQMBAwCBgQMBgQMBAwCBgQMBgQMAgYEDAYCBgQMAQIGBgYEDAQMBAwEDAQMBAwEDAQMBAwEDAMJAwkGBAwEDAQMBAwEDAQMBAwEDAQMAwkDCQYEDAQMBAwEDAQMBAwEDAQMAwkDCQYEDAQMBAwEDAQMBAwEDAMJAwkGBAwEDAQMBAwEDAQMAwkDCQYEDAQMBAwEDAQMAwkDCQYEDAQMBAwEDAMJAwkGBAwEDAQMAwkDCQYEDAQMAwkDCQYEDAMJAwkGAwkDCQMDBgMGBAwEDAQMBAwEDAQMBAwEDAQMBAwDCQMJBgQMBAwEDAQMBAwEDAQMBAwEDAMJAwkGBAwEDAQMBAwEDAQMBAwEDAMJAwkGBAwEDAQMBAwEDAQMBAwDCQMJBgQMBAwEDAQMBAwEDAMJAwkGBAwEDAQMBAwEDAMJAwkGBAwEDAQMBAwDCQMJBgQMBAwEDAMJAwkGBAwEDAMJAwkGBAwDCQMJBgMJAwkDAgcDBgQMBAwEDAQMBAwEDAQMBAwEDAQMBAwCBgYEDAQMBAwEDAQMBAwEDAQMBAwEDAIGBgQMBAwEDAQMBAwEDAQMBAwEDAIGBgQMBAwEDAQMBAwEDAQMBAwCBgYEDAQMBAwEDAQMBAwEDAIGBgQMBAwEDAQMBAwEDAIGBgQMBAwEDAQMBAwCBgYEDAQMBAwEDAIGBgQMBAwEDAIGBgQMBAwCBgYEDAIGBgIGAQ==';
     const ORDER169_B64 = 'ABkwRVgBaQIDBAV4BwaFCAmQGgsKHBuZDR4MDxEdE6AxDhUfFyAzEBKlFDJGIhYkITUYNCaoSCg3WSpHI0osJVs2Ljk7aidMST0pXThaPytseUFOSy1QQ1xfOi9SbntrPIZUTT5WYV5AY3BtfZF6iEJlT1FnmkRgcn+TU2+KfHSHVXacV2KVgWSMcaGSfoOJZp6baJeOo3OUgIt1pnedloKNooSfmKSPpw==';
     const PUSHFOLD_TABLE = {"depths":[2,3,4,5,6,7,8,10,12,15,20],"push":{"2":[100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,32,100,1,100,100,100,100,100,100,100,100,1,100,0,100,100,100,100,100,100,0,100,0,100,100,100,100,1,100,0,100,100,0,1,0,100,0,0,100],"3":[100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,26,100,100,100,100,100,100,100,100,100,100,0,100,0,100,0,100,100,100,100,100,100,67,100,0,1,0,0,0,100,100,100,100,0,100,0,0,0,0,0,100,100,0,100,0,0,0,0,0,100,100,0,0,0,0,0,100,0,0,0,0,100,0,0,100],"4":[100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,1,100,0,100,0,100,100,100,100,100,100,100,100,0,100,0,100,0,0,0,100,100,100,100,100,100,0,99,0,0,0,0,0,100,100,99,100,0,99,0,0,0,0,0,100,100,0,99,0,0,0,0,0,100,100,0,0,0,0,0,100,0,0,0,0,100,0,0,100],"5":[100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,0,100,100,100,100,100,100,100,100,100,100,0,100,0,100,0,100,0,100,100,100,100,100,100,20,100,0,99,0,1,0,0,0,100,100,100,100,99,100,0,99,0,0,0,0,0,100,100,99,100,0,99,0,0,0,0,0,100,100,0,99,0,0,0,0,0,100,100,0,99,0,0,0,100,87,0,0,0,100,0,0,100],"6":[100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,0,100,0,100,0,100,100,100,100,100,100,100,100,0,100,0,100,0,100,0,98,0,100,100,100,100,100,100,0,100,0,29,0,0,0,0,0,100,100,100,100,98,100,0,99,0,0,0,0,0,100,100,99,100,0,99,0,0,0,0,0,100,100,1,99,0,97,0,0,0,100,100,0,99,0,0,0,100,98,0,0,0,100,0,0,100],"7":[100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,0,100,0,100,0,100,0,100,0,100,100,100,100,100,100,100,100,0,100,0,100,0,99,0,0,0,100,100,100,100,100,100,0,100,0,0,0,0,0,0,0,100,100,100,100,73,100,0,99,0,0,0,0,0,100,100,99,100,0,99,0,0,0,0,0,100,100,0,99,0,97,0,0,0,100,100,0,99,0,0,0,100,98,0,0,0,100,0,0,100],"8":[100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,11,100,0,100,0,100,100,100,100,100,100,100,100,100,100,0,100,0,100,0,100,0,99,0,100,100,100,100,100,100,90,100,0,100,0,99,0,1,0,0,0,100,100,100,100,99,100,0,99,0,0,0,0,0,0,0,100,100,99,100,1,100,0,34,0,0,0,0,0,100,100,99,100,0,99,0,0,0,0,0,100,100,0,99,0,0,0,0,0,100,100,0,99,0,0,0,100,2,0,0,0,100,0,0,100],"10":[100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,6,100,0,100,0,100,0,100,0,100,100,100,100,100,100,100,100,0,100,0,100,0,100,0,99,0,0,0,100,100,100,100,100,100,5,100,0,99,0,99,0,0,0,0,0,100,100,100,100,99,100,0,99,0,0,0,0,0,0,0,100,100,99,100,0,99,0,98,0,0,0,0,0,100,100,99,100,0,99,0,0,0,0,0,100,100,0,99,0,0,0,0,0,100,100,0,99,0,0,0,100,12,0,0,0,100,0,0,100],"12":[100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,1,100,100,100,100,100,100,100,100,100,100,0,100,0,100,0,100,0,100,0,99,0,100,100,100,100,100,100,100,100,0,100,0,100,0,99,0,0,0,0,0,100,100,100,100,99,100,0,100,0,72,0,0,0,0,0,0,0,100,100,99,100,2,100,0,99,0,0,0,0,0,0,0,100,100,99,100,0,99,0,0,0,0,0,0,0,100,100,0,99,0,98,0,0,0,0,0,100,100,0,99,0,0,0,0,0,100,99,0,98,0,0,0,100,0,0,0,0,100,0,0,100],"15":[100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,1,100,0,100,0,100,0,100,100,100,100,100,100,100,100,0,100,0,100,0,100,0,55,0,0,0,0,0,100,100,100,100,100,100,0,100,0,99,0,32,0,0,0,0,0,0,0,100,100,100,100,96,100,0,99,0,0,0,0,0,0,0,0,0,100,100,99,100,0,99,0,2,0,0,0,0,0,0,0,100,100,7,99,0,99,0,0,0,0,0,0,0,100,100,0,99,0,0,0,0,0,0,0,100,99,0,98,0,0,0,0,0,100,99,0,0,0,0,0,100,0,0,0,0,100,0,0,100],"20":[100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,1,100,0,100,0,100,0,100,0,14,0,0,0,100,100,100,100,100,100,99,100,0,99,0,99,0,99,0,0,0,0,0,0,0,100,100,100,100,99,100,0,99,0,0,0,0,0,0,0,0,0,0,0,100,100,99,100,0,99,0,98,0,0,0,0,0,0,0,0,0,100,100,98,99,0,99,0,0,0,0,0,0,0,0,0,100,99,0,99,0,0,0,0,0,0,0,0,0,100,99,0,98,0,0,0,0,0,0,0,100,99,0,0,0,0,0,0,0,100,98,0,0,0,0,0,100,0,0,0,0,100,0,0,100]},"call":{"2":[100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100],"3":[100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,2,100,1,100,100,100,100,100,100,100,100,2,100,0,100,100,100,100,100,100,42,100,0,100,100,100,100,100,100,0,100,100,100,100,0,100,100,0,100],"4":[100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,1,100,1,100,0,100,100,100,100,100,100,100,100,1,100,0,100,0,1,0,100,100,100,100,100,100,0,100,0,0,0,0,0,100,100,100,100,0,100,0,0,0,0,0,100,100,0,100,0,0,0,0,0,100,100,0,100,0,0,0,100,0,0,0,0,100,0,0,100],"5":[100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,0,100,0,100,0,100,100,100,100,100,100,100,100,0,100,0,98,0,0,0,0,0,100,100,100,100,96,100,0,41,0,0,0,0,0,0,0,100,100,0,100,0,0,0,0,0,0,0,0,0,100,100,0,0,0,0,0,0,0,0,0,100,1,0,0,0,0,0,0,0,100,0,0,0,0,0,0,100,0,0,0,0,100,0,0,100],"6":[100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,1,100,0,100,100,100,100,100,100,100,100,100,100,0,100,0,99,0,0,0,0,0,100,100,100,100,100,100,0,98,0,0,0,0,0,0,0,0,0,100,100,92,100,0,0,0,0,0,0,0,0,0,0,0,100,100,0,0,0,0,0,0,0,0,0,0,0,100,0,0,0,0,0,0,0,0,0,0,100,0,0,0,0,0,0,0,0,100,0,0,0,0,0,0,100,0,0,0,0,100,0,0,100],"7":[100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,0,100,0,100,0,100,0,100,100,100,100,100,100,100,100,0,95,0,0,0,0,0,0,0,0,0,100,100,100,100,0,99,0,0,0,0,0,0,0,0,0,0,0,100,100,0,58,0,0,0,0,0,0,0,0,0,0,0,100,0,0,0,0,0,0,0,0,0,0,0,0,100,0,0,0,0,0,0,0,0,0,0,100,0,0,0,0,0,0,0,0,100,0,0,0,0,0,0,100,0,0,0,0,100,0,0,100],"8":[100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,55,100,0,100,0,99,0,0,0,0,0,100,100,100,100,100,100,0,99,0,0,0,0,0,0,0,0,0,0,0,100,100,98,100,0,0,0,0,0,0,0,0,0,0,0,0,0,100,98,0,0,0,0,0,0,0,0,0,0,0,0,0,100,0,0,0,0,0,0,0,0,0,0,0,0,100,0,0,0,0,0,0,0,0,0,0,100,0,0,0,0,0,0,0,0,100,0,0,0,0,0,0,100,0,0,0,0,100,0,0,100],"10":[100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,99,100,0,100,0,100,0,100,100,100,100,100,100,100,100,1,99,0,0,0,0,0,0,0,0,0,0,0,100,100,100,100,0,98,0,0,0,0,0,0,0,0,0,0,0,0,0,100,99,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,100,0,0,0,0,0,0,0,0,0,0,0,0,100,0,0,0,0,0,0,0,0,0,0,100,0,0,0,0,0,0,0,0,100,0,0,0,0,0,0,100,0,0,0,0,100,0,0,100],"12":[100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,0,100,0,99,0,0,0,0,0,100,100,100,100,100,100,0,98,0,0,0,0,0,0,0,0,0,0,0,0,0,100,100,98,99,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,100,0,0,0,0,0,0,0,0,0,0,0,0,100,0,0,0,0,0,0,0,0,0,0,100,0,0,0,0,0,0,0,0,100,0,0,0,0,0,0,100,0,0,0,0,100,0,0,100],"15":[100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,0,99,0,0,0,0,0,0,0,0,0,0,0,100,100,100,100,73,97,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,100,99,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,100,0,0,0,0,0,0,0,0,0,0,0,0,100,0,0,0,0,0,0,0,0,0,0,100,0,0,0,0,0,0,0,0,100,0,0,0,0,0,0,100,0,0,0,0,100,0,0,100],"20":[100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,99,100,98,100,1,100,0,100,0,100,100,100,100,100,100,99,99,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,100,100,0,97,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,100,0,0,0,0,0,0,0,0,0,0,0,0,100,0,0,0,0,0,0,0,0,0,0,100,0,0,0,0,0,0,0,0,100,0,0,0,0,0,0,100,0,0,0,0,100,0,0,0]},"note":"Heads-up SB vs BB chip-EV Nash, fictitious play; frequencies 0-100 per class."};
-    const PRIORS_TABLE = {"schema":1,"note":"Pool priors. mean = pool rate, k = prior strength in pseudo-opportunities.","stats":{"vpip":{"mean":0.425,"k":10.3,"source":"borrowed-ww","kSource":"irc","externalMean":0.4466},"pfr":{"mean":0.094,"k":14.5,"source":"borrowed-ww","kSource":"irc","externalMean":0.1111},"limp":{"mean":0.22,"k":5.2,"source":"assumed","kSource":"phh","externalMean":0.0991},"rfi":{"mean":0.12,"k":19.6,"source":"assumed","kSource":"phh","externalMean":0.1429},"threebet":{"mean":0.04,"k":60,"source":"assumed","kSource":"phh","externalMean":0.0321},"f3b":{"mean":0.45,"k":19.3,"source":"assumed","kSource":"phh","externalMean":0.484},"fvo.s1":{"mean":0.45,"k":12.4,"source":"assumed","kSource":"phh","externalMean":0.7759},"fvo.s2":{"mean":0.3,"k":11.3,"source":"torn-s5","kSource":"phh","externalMean":0.8642,"note":"a single raise never won the pot outright 0/25"},"fvo.s3":{"mean":0.4,"k":8.3,"source":"torn-s5","kSource":"phh","externalMean":0.9222,"note":"a single raise never won the pot outright 0/25"},"fvo.s4":{"mean":0.75,"k":8.8,"source":"assumed","kSource":"phh","externalMean":0.9695},"fiso.s1":{"mean":0.15,"k":20,"source":"torn-s5","kSource":"phh","externalMean":0.0751,"note":"limpers fold to a raise 7/35 (CI 10-36%) at $25k/$50k, 2026-09-27"},"fiso.s2":{"mean":0.15,"k":12.7,"source":"torn-s5","kSource":"phh","externalMean":0.3756,"note":"limpers fold to a raise 7/35 (CI 10-36%)"},"fiso.s3":{"mean":0.2,"k":8.6,"source":"torn-s5","kSource":"phh","externalMean":0.6298,"note":"limpers fold to a raise 7/35, a little more to bigger raises (assumed slope)"},"fiso.s4":{"mean":0.35,"k":20,"source":"torn-s5","kSource":"phh","externalMean":0.9166,"note":"no Torn data above 8 bb; kept well below the old 0.62"},"shove.d1":{"mean":0.1,"k":4.3,"source":"assumed","kSource":"phh","externalMean":0.0795},"shove.d2":{"mean":0.04,"k":16.7,"source":"assumed","kSource":"phh","externalMean":0.0135},"shove.d3":{"mean":0.015,"k":24.5,"source":"assumed","kSource":"phh","externalMean":0.0086},"shove.d4":{"mean":0.008,"k":53.7,"source":"assumed","kSource":"phh","externalMean":0.0002},"cbet.flop":{"mean":0.4,"k":14.5,"source":"assumed","kSource":"phh","externalMean":0.685},"cbet.turn":{"mean":0.35,"k":16.6,"source":"assumed","kSource":"phh","externalMean":0.5965},"cbet.river":{"mean":0.35,"k":25.6,"source":"assumed","kSource":"phh","externalMean":0.6351},"fcb.flop":{"mean":0.449,"k":43.9,"source":"borrowed-ww","kSource":"phh","externalMean":0.6015},"fcb.turn":{"mean":0.45,"k":51,"source":"assumed","kSource":"phh","externalMean":0.4023},"fcb.river":{"mean":0.45,"k":52.3,"source":"assumed","kSource":"phh","externalMean":0.6102},"fbet.b1":{"mean":0.2452,"k":26.3,"source":"shape-phh","kSource":"phh","externalMean":0.5012,"shapeOffset":-0.659,"tornLevel":0.3857},"fbet.b2":{"mean":0.3945,"k":23.6,"source":"shape-phh","kSource":"phh","externalMean":0.6716,"shapeOffset":0.0368,"tornLevel":0.3857},"fbet.b3":{"mean":0.5034,"k":22.4,"source":"shape-phh","kSource":"phh","externalMean":0.7661,"shapeOffset":0.4791,"tornLevel":0.3857},"fbet.b4":{"mean":0.6385,"k":21.8,"source":"shape-phh","kSource":"phh","externalMean":0.8569,"shapeOffset":1.0344,"tornLevel":0.3857},"donk":{"mean":0.1,"k":15,"source":"assumed"},"xr":{"mean":0.06,"k":20,"source":"assumed"},"afq":{"mean":0.38,"k":16.4,"source":"torn","n":174,"note":"folds counted (HUD definition) from 2026-09-27; Torn 66/174, CI 31-45%","externalMean":0.5379},"wtsd":{"mean":0.32,"k":60,"source":"assumed","kSource":"irc","externalMean":0.4115},"wsd":{"mean":0.5,"k":55.9,"source":"assumed","kSource":"phh","externalMean":0.6012},"fcb.flop.b1":{"mean":0.3372,"k":43.9,"source":"shape-phh","shapeOffset":-0.471},"fcb.flop.b2":{"mean":0.4493,"k":43.9,"source":"shape-phh","shapeOffset":0.0012},"fcb.flop.b3":{"mean":0.5223,"k":43.9,"source":"shape-phh","shapeOffset":0.2941},"fcb.flop.b4":{"mean":0.6345,"k":43.9,"source":"shape-phh","shapeOffset":0.7563},"fcb.turn.b1":{"mean":0.3022,"k":51,"source":"shape-phh","shapeOffset":-0.6364},"fcb.turn.b2":{"mean":0.5098,"k":51,"source":"shape-phh","shapeOffset":0.24},"fcb.turn.b3":{"mean":0.6338,"k":51,"source":"shape-phh","shapeOffset":0.7491},"fcb.turn.b4":{"mean":0.7402,"k":51,"source":"shape-phh","shapeOffset":1.2474},"fcb.river.b1":{"mean":0.3425,"k":52.3,"source":"shape-phh","shapeOffset":-0.4515},"fcb.river.b2":{"mean":0.5054,"k":52.3,"source":"shape-phh","shapeOffset":0.2221},"fcb.river.b3":{"mean":0.5912,"k":52.3,"source":"shape-phh","shapeOffset":0.5698},"fcb.river.b4":{"mean":0.7118,"k":52.3,"source":"shape-phh","shapeOffset":1.1047},"fraise":{"mean":0.17,"k":20,"source":"torn-s5","note":"a bettor facing a raise folded 2/15 (CI 4-38%)"},"fcold":{"mean":0.6,"k":15,"source":"torn-s5","note":"post-flop, a player with no chips in this street facing a raise folded 15/23 (CI 45-81%)"},"callmix":{"mean":0.4,"k":20,"source":"torn-s5","note":"share of a caller range that is not the top slice: 8/22 shown callers sat in the bottom 10% of the modelled continuing range"}},"byStake":{"vpip":{"50000":{"mean":0.6,"source":"torn-s5"},"500000":{"mean":0.549,"source":"borrowed-ww"},"1000000":{"mean":0.462,"source":"borrowed-ww"},"2500000":{"mean":0.426,"source":"borrowed-ww"}},"limp":{"50000":{"mean":0.55,"source":"torn-s5"}}}};
+    const PRIORS_TABLE = {"schema":1,"note":"Pool priors. mean = pool rate, k = prior strength in pseudo-opportunities.","stats":{"vpip":{"mean":0.425,"k":10.3,"source":"borrowed-ww","kSource":"irc","externalMean":0.4466},"pfr":{"mean":0.094,"k":14.5,"source":"borrowed-ww","kSource":"irc","externalMean":0.1111},"limp":{"mean":0.22,"k":5.2,"source":"assumed","kSource":"phh","externalMean":0.0991},"rfi":{"mean":0.12,"k":19.6,"source":"assumed","kSource":"phh","externalMean":0.1429},"threebet":{"mean":0.04,"k":60,"source":"assumed","kSource":"phh","externalMean":0.0321},"f3b":{"mean":0.45,"k":19.3,"source":"assumed","kSource":"phh","externalMean":0.484},"fvo.s1":{"mean":0.45,"k":12.4,"source":"assumed","kSource":"phh","externalMean":0.7759},"fvo.s2":{"mean":0.3,"k":11.3,"source":"torn-s5","kSource":"phh","externalMean":0.8642,"note":"a single raise never won the pot outright 0/25"},"fvo.s3":{"mean":0.4,"k":8.3,"source":"torn-s5","kSource":"phh","externalMean":0.9222,"note":"a single raise never won the pot outright 0/25"},"fvo.s4":{"mean":0.75,"k":8.8,"source":"assumed","kSource":"phh","externalMean":0.9695},"fiso.s1":{"mean":0.15,"k":20,"source":"torn-s5","kSource":"phh","externalMean":0.0751,"note":"limpers fold to a raise 7/35 (CI 10-36%) at $25k/$50k, 2026-09-27"},"fiso.s2":{"mean":0.15,"k":12.7,"source":"torn-s5","kSource":"phh","externalMean":0.3756,"note":"limpers fold to a raise 7/35 (CI 10-36%)"},"fiso.s3":{"mean":0.2,"k":8.6,"source":"torn-s5","kSource":"phh","externalMean":0.6298,"note":"limpers fold to a raise 7/35, a little more to bigger raises (assumed slope)"},"fiso.s4":{"mean":0.35,"k":20,"source":"torn-s5","kSource":"phh","externalMean":0.9166,"note":"no Torn data above 8 bb; kept well below the old 0.62"},"shove.d1":{"mean":0.1,"k":4.3,"source":"assumed","kSource":"phh","externalMean":0.0795},"shove.d2":{"mean":0.04,"k":16.7,"source":"assumed","kSource":"phh","externalMean":0.0135},"shove.d3":{"mean":0.015,"k":24.5,"source":"assumed","kSource":"phh","externalMean":0.0086},"shove.d4":{"mean":0.008,"k":53.7,"source":"assumed","kSource":"phh","externalMean":0.0002},"cbet.flop":{"mean":0.4,"k":14.5,"source":"assumed","kSource":"phh","externalMean":0.685},"cbet.turn":{"mean":0.35,"k":16.6,"source":"assumed","kSource":"phh","externalMean":0.5965},"cbet.river":{"mean":0.35,"k":25.6,"source":"assumed","kSource":"phh","externalMean":0.6351},"fcb.flop":{"mean":0.449,"k":43.9,"source":"borrowed-ww","kSource":"phh","externalMean":0.6015},"fcb.turn":{"mean":0.45,"k":51,"source":"assumed","kSource":"phh","externalMean":0.4023},"fcb.river":{"mean":0.45,"k":52.3,"source":"assumed","kSource":"phh","externalMean":0.6102},"fbet.b1":{"mean":0.2452,"k":26.3,"source":"shape-phh","kSource":"phh","externalMean":0.5012,"shapeOffset":-0.659,"tornLevel":0.3857},"fbet.b2":{"mean":0.3945,"k":23.6,"source":"shape-phh","kSource":"phh","externalMean":0.6716,"shapeOffset":0.0368,"tornLevel":0.3857},"fbet.b3":{"mean":0.5034,"k":22.4,"source":"shape-phh","kSource":"phh","externalMean":0.7661,"shapeOffset":0.4791,"tornLevel":0.3857},"fbet.b4":{"mean":0.6385,"k":21.8,"source":"shape-phh","kSource":"phh","externalMean":0.8569,"shapeOffset":1.0344,"tornLevel":0.3857},"donk":{"mean":0.1,"k":15,"source":"assumed"},"xr":{"mean":0.06,"k":20,"source":"assumed"},"afq":{"mean":0.19,"k":16.4,"source":"torn","n":825,"note":"every post-flop action counts, checks and folds included, from 0.7.0 (docs/plan.md M1); Torn 155/825: $500/$1k 59/361 = 16%, $25k/$50k 96/464 = 21%","externalMean":0.5379},"wtsd":{"mean":0.32,"k":60,"source":"assumed","kSource":"irc","externalMean":0.4115},"wsd":{"mean":0.5,"k":55.9,"source":"assumed","kSource":"phh","externalMean":0.6012},"fcb.flop.b1":{"mean":0.3372,"k":43.9,"source":"shape-phh","shapeOffset":-0.471},"fcb.flop.b2":{"mean":0.4493,"k":43.9,"source":"shape-phh","shapeOffset":0.0012},"fcb.flop.b3":{"mean":0.5223,"k":43.9,"source":"shape-phh","shapeOffset":0.2941},"fcb.flop.b4":{"mean":0.6345,"k":43.9,"source":"shape-phh","shapeOffset":0.7563},"fcb.turn.b1":{"mean":0.3022,"k":51,"source":"shape-phh","shapeOffset":-0.6364},"fcb.turn.b2":{"mean":0.5098,"k":51,"source":"shape-phh","shapeOffset":0.24},"fcb.turn.b3":{"mean":0.6338,"k":51,"source":"shape-phh","shapeOffset":0.7491},"fcb.turn.b4":{"mean":0.7402,"k":51,"source":"shape-phh","shapeOffset":1.2474},"fcb.river.b1":{"mean":0.3425,"k":52.3,"source":"shape-phh","shapeOffset":-0.4515},"fcb.river.b2":{"mean":0.5054,"k":52.3,"source":"shape-phh","shapeOffset":0.2221},"fcb.river.b3":{"mean":0.5912,"k":52.3,"source":"shape-phh","shapeOffset":0.5698},"fcb.river.b4":{"mean":0.7118,"k":52.3,"source":"shape-phh","shapeOffset":1.1047},"fraise":{"mean":0.17,"k":20,"source":"torn-s5","note":"a bettor facing a raise folded 2/15 (CI 4-38%)"},"fcold":{"mean":0.6,"k":15,"source":"torn-s5","note":"post-flop, a player with no chips in this street facing a raise folded 15/23 (CI 45-81%)"},"callmix":{"mean":0.4,"k":20,"source":"torn-s5","note":"share of a caller range that is not the top slice: 8/22 shown callers sat in the bottom 10% of the modelled continuing range"}},"byStake":{"vpip":{"50000":{"mean":0.6,"source":"torn-s5"},"500000":{"mean":0.549,"source":"borrowed-ww"},"1000000":{"mean":0.462,"source":"borrowed-ww"},"2500000":{"mean":0.426,"source":"borrowed-ww"}},"limp":{"50000":{"mean":0.55,"source":"torn-s5"}}}};
     const LIKELIHOOD_TABLE = {"schema":1,"source":"phh.jsonl","hands":33209,"note":"Fitted on showdown hands only: a floor on bet strength (bluffs that won uncontested are unseen).","bet":{"t":0.9294,"w":0.1339,"b":0.1698,"n":129856},"raise":{"t":1.0114,"w":0.0545,"b":0.1142,"n":51179},"betSize":{"a":[0,-0.2194,-1.2665,-2.3058],"g":[0,0.3191,0.6648,0.6169],"g_se":[0,0.0214,0.0569,0.0898],"edges":[0.4,0.7,1.1],"n":28506,"holdout_gain_per_bet":0.00176,"shares":[0.3833,0.3845,0.1731,0.0591]}};
     const FOLDCURVE_TABLE = {"schema":1,"source":"shape-phh","slope":0.9594,"offsets":{"flop.hu":-0.1775,"flop.mw":0.2196,"turn.hu":-0.22,"turn.mw":0.5713,"river.hu":0.3784,"river.mw":1.2724},"centres":{"b1":0.33,"b2":0.55,"b3":0.85,"b4":1.5},"slopes":{"flop.hu":1.0031,"flop.mw":0.8738,"turn.hu":1.2277,"turn.mw":1.161,"river.hu":1.0315,"river.mw":1.0325},"note":"logit fold = level(bucket prior) + slope * ln(size / bucket centre) + offset[street.hu|mw]"};
     const TILT_TABLE = {"schema":1,"source":"tilt-irc","note":"Recency: decayed counts (half-life in the player's hands) shrunk to the lifetime rate with weight m. States: logit offsets measured on top of that, kept only where the 95% interval excludes zero.","recency":{"pre":{"halfLife":25,"m":16,"gain":0.00928},"raise":{"halfLife":25,"m":16,"gain":0.01874},"postAgg":{"halfLife":50,"m":32,"gain":0.00539},"postFold":{"halfLife":50,"m":64,"gain":0.00156},"shove":{"halfLife":25,"m":64,"gain":0.00031}},"states":{"bigLoss":{"lossBB":50,"hands":5},"sessionDown":{"netBB":-100,"gapMin":30}},"offsets":{"bigLoss":{"pre":{"beta":0.0425,"pp":1.04,"ci":[0.72,1.35]},"raise":{"beta":0.0696,"pp":0.67,"ci":[0.41,0.94]},"shove":{"beta":0.18,"pp":0.05,"ci":[0.02,0.08]}},"sessionDown":{"pre":{"beta":0.0376,"pp":0.91,"ci":[0.73,1.1]},"raise":{"beta":0.1058,"pp":1.04,"ci":[0.88,1.2]},"postAgg":{"beta":0.0448,"pp":1.02,"ci":[0.73,1.31]},"postFold":{"beta":-0.0199,"pp":-0.47,"ci":[-0.73,-0.21]},"shove":{"beta":0.8217,"pp":0.3,"ci":[0.27,0.33]}}}};
@@ -1499,6 +1686,216 @@
         return { fraction: live ? sum / live : 0, classes, text: classes.slice(0, 14).join(', ') + (classes.length > 14 ? '…' : '') };
     }
 
+    /* ===== src/core/rangestr.js ===== */
+    /*
+     * Range strings like "22+,A2s+,KTs+,ATo+,KJo+,QJo,A5s-A3s" -> 1,326 weights.
+     * Used by the simulator's WWpokerHUD replica (its charts are MIT) and tests.
+     */
+
+
+    const ORDER = 'AKQJT98765432';
+
+    function expand(token) {
+        const t = token.trim();
+        if (!t) return [];
+        const range = /^([2-9TJQKA])([2-9TJQKA])([so]?)-([2-9TJQKA])([2-9TJQKA])([so]?)$/.exec(t);
+        if (range) {
+            const [, a, b, s, , d] = range;
+            const out = [];
+            const from = ORDER.indexOf(b);
+            const to = ORDER.indexOf(d);
+            for (let i = Math.min(from, to); i <= Math.max(from, to); i++) out.push(a + ORDER[i] + s);
+            return out;
+        }
+        const m = /^([2-9TJQKA])([2-9TJQKA])([so]?)(\+?)$/.exec(t);
+        if (!m) return [];
+        const [, a, b, s, plus] = m;
+        if (a === b) {
+            if (!plus) return [a + a];
+            const out = [];
+            for (let i = ORDER.indexOf(a); i >= 0; i--) out.push(ORDER[i] + ORDER[i]);
+            return out;
+        }
+        const hi = ORDER.indexOf(a) < ORDER.indexOf(b) ? a : b;
+        const lo = hi === a ? b : a;
+        const suffixes = s ? [s] : ['s', 'o'];
+        const out = [];
+        const start = ORDER.indexOf(lo);
+        const stop = plus ? ORDER.indexOf(hi) + 1 : start;
+        for (let i = start; i >= stop; i--) for (const x of suffixes) out.push(hi + ORDER[i] + x);
+        return out;
+    }
+
+    function classesOf(text) {
+        const set = new Set();
+        for (const token of String(text).split(',')) for (const c of expand(token)) if (classIndexByName(c) >= 0) set.add(c);
+        return set;
+    }
+
+    function rangeFromString(text) {
+        const set = new Set([...classesOf(text)].map(classIndexByName));
+        const w = new Float32Array(1326);
+        for (let k = 0; k < 1326; k++) w[k] = set.has(COMBO_CLASS[k]) ? 1 : 0;
+        return w;
+    }
+
+    const inRangeString = (text, className) => classesOf(text).has(className);
+
+    /* ===== src/core/pool.js ===== */
+    /*
+     * Pool model v1: the shover type model (docs/plan.md, architecture table; fixed at M1, refit at
+     * 500 hands per stake in M7).
+     *
+     * Two types per player: S, the for-fun shover (any two cards), and N, the value shover.
+     *   frequency  hands dealt with >= 20 bb: S shoves in 30% of them, N in 2%
+     *              (x15 odds per shove seen, x0.71 per hand without one)
+     *   shown      a shown shove is "junk" outside the top 15% of hands: P(junk | S) = 0.85,
+     *              P(junk | N) = 0.15 (x5.67 odds per junk show, x0.176 per non-junk show)
+     *   prior      P(S) = 0.10 at $500/$1k, 0.02 at $25k/$50k, 0.05 at any other stake
+     * Shown shoves are nearly unbiased evidence: the caller cannot see the shover's cards.
+     * Counts live in the player store (stats.js), so the posterior is rebuilt from raw hands.
+     */
+
+
+
+
+
+    const SHOVER = Object.freeze({
+        junkTop: 0.15,
+        pJunkS: 0.85,
+        pJunkN: 0.15,
+        freqS: 0.3,
+        freqN: 0.02,
+        minBB: 20,
+        prior: { 1000: 0.1, 50000: 0.02 },
+        priorOther: 0.05,
+    });
+
+    const shoverPrior = (bb) => SHOVER.prior[bb] ?? SHOVER.priorOther;
+
+    const shLogit = (p) => Math.log(p / (1 - p));
+    const shInv = (x) => 1 / (1 + Math.exp(-x));
+
+    /**
+     * @param {{ stats?: object } | null} player  store entry (stats.js): stats['shv:<bb>'] = [hands >= 20 bb, hands with a
+     *        preflop shove], stats['shvj:<bb>'] = [shown shoves, junk among them], at this stake only
+     * @returns {{ p: number, prior: number, hands: number, shoves: number, shown: number, junk: number }}
+     */
+    function shoverPosterior(player, bb, { weight = 1 } = {}) {
+        const prior = shoverPrior(bb);
+        const st = (player && player.stats) || {};
+        const [hands, shoves] = st['shv:' + bb] || [0, 0];
+        const [shown, junk] = st['shvj:' + bb] || [0, 0];
+        const S = SHOVER;
+        const evidence = shoves * Math.log(S.freqS / S.freqN)
+            + (hands - shoves) * Math.log((1 - S.freqS) / (1 - S.freqN))
+            + junk * Math.log(S.pJunkS / S.pJunkN)
+            + (shown - junk) * Math.log((1 - S.pJunkS) / (1 - S.pJunkN));
+        return { p: shInv(shLogit(prior) + weight * evidence), prior, hands, shoves, shown, junk };
+    }
+
+    /** Strength percentile of a combo on this board among all live combos (0 = strongest). Preflop: the class order. */
+    function shoveStrength(cards, board) {
+        if (!board.length) return tables().percentile[classOfCards(cards[0], cards[1])];
+        const used = new Uint8Array(52);
+        for (const c of board) used[c] = 1;
+        for (const c of cards) used[c] = 1;
+        const hand = new Array(2 + board.length);
+        for (let i = 0; i < board.length; i++) hand[2 + i] = board[i];
+        hand[0] = cards[0];
+        hand[1] = cards[1];
+        const mine = evaluate(hand, hand.length);
+        let better = 0;
+        let equal = 0;
+        let total = 0;
+        for (let k = 0; k < 1326; k++) {
+            const a = COMBO_A[k];
+            const b = COMBO_B[k];
+            if (used[a] || used[b]) continue;
+            hand[0] = a;
+            hand[1] = b;
+            const s = evaluate(hand, hand.length);
+            total++;
+            if (s > mine) better++;
+            else if (s === mine) equal++;
+        }
+        return total ? (better + equal / 2) / total : 0.5;
+    }
+
+    const isJunk = (cards, board) => shoveStrength(cards, board) > SHOVER.junkTop;
+
+    /* Value ranges of the N type by effective depth [Opinion, refit in M7]: deep shoves on Torn were QQ+/AK
+       ($25k/$50k, research/opus.md §f); push/fold depths shove the top 15%. */
+    const VALUE_BY_DEPTH = { deep: 'QQ+,AK', mid: 'TT+,AQ+,KQs' };
+    let valueCache = null;
+    function valueRange(depth) {
+        if (!valueCache) valueCache = { deep: rangeFromString(VALUE_BY_DEPTH.deep), mid: rangeFromString(VALUE_BY_DEPTH.mid) };
+        return valueCache[depth] || null;
+    }
+
+    const depthOf = (effBB) => (effBB > 40 ? 'deep' : effBB > 20 ? 'mid' : 'short');
+
+    /**
+     * The two type ranges for one shove, as 1,326 weights normalised to mass 1 over live combos.
+     * N = 85% on its value set, 15% on junk (outside the top 15%); S = every live combo equally.
+     * Post-flop the value set is the top 5% of combos by made hand on this board.
+     */
+    function typeRanges(board, dead, effBB) {
+        const used = new Uint8Array(52);
+        for (const c of board) used[c] = 1;
+        for (const c of dead) used[c] = 1;
+        const pct = new Float32Array(1326).fill(-1);
+        if (board.length) {
+            const hand = new Array(2 + board.length);
+            for (let i = 0; i < board.length; i++) hand[2 + i] = board[i];
+            const items = [];
+            for (let k = 0; k < 1326; k++) {
+                if (used[COMBO_A[k]] || used[COMBO_B[k]]) continue;
+                hand[0] = COMBO_A[k];
+                hand[1] = COMBO_B[k];
+                items.push([k, evaluate(hand, hand.length)]);
+            }
+            items.sort((x, y) => y[1] - x[1]);
+            for (let i = 0; i < items.length; ) {
+                let j = i;
+                while (j < items.length && items[j][1] === items[i][1]) j++;
+                const mid = (i + j) / 2 / items.length;
+                for (let t = i; t < j; t++) pct[items[t][0]] = mid;
+                i = j;
+            }
+        } else {
+            const cp = tables().percentile;
+            for (let k = 0; k < 1326; k++) if (!used[COMBO_A[k]] && !used[COMBO_B[k]]) pct[k] = cp[COMBO_CLASS[k]];
+        }
+        const depth = depthOf(effBB);
+        const vset = board.length ? null : valueRange(depth);
+        const inValue = (k) => (vset ? vset[k] > 0 : pct[k] <= (board.length ? 0.05 : SHOVER.junkTop));
+        const S = new Float32Array(1326);
+        const N = new Float32Array(1326);
+        let nS = 0;
+        let nV = 0;
+        let nJ = 0;
+        for (let k = 0; k < 1326; k++) {
+            if (pct[k] < 0) continue;
+            nS++;
+            if (inValue(k)) nV++;
+            else if (pct[k] > SHOVER.junkTop) nJ++;
+        }
+        for (let k = 0; k < 1326; k++) {
+            if (pct[k] < 0) continue;
+            S[k] = 1 / nS;
+            if (inValue(k)) N[k] = (1 - SHOVER.pJunkN) / Math.max(1, nV);
+            else if (pct[k] > SHOVER.junkTop) N[k] = SHOVER.pJunkN / Math.max(1, nJ);
+        }
+        return { S, N, depth };
+    }
+
+    function mixture(S, N, p) {
+        const out = new Float32Array(1326);
+        for (let k = 0; k < 1326; k++) out[k] = p * S[k] + (1 - p) * N[k];
+        return out;
+    }
+
     /* ===== src/core/stats.js ===== */
     /*
      * Opponent stats, counted PER OPPORTUNITY (spec §7.2, L4). This file is the
@@ -1513,8 +1910,11 @@
      *   cbet.<street> fcb.<street>[.<b1-b4>][.hu|.mw] fbet.<b1-b4> donk xr afq wtsd wsd
      *   fraise        post-flop: a player who bet or raised this street folding when raised
      *   fcold         post-flop: a player with no chips in this street folding to a raise
+     *   shv:<bb>      hands dealt with >= 20 bb, and those with a preflop all-in raise from >= 20 bb (pool.js), per stake
+     *   shvj:<bb>     those shoves shown at showdown, and the junk among them (outside the top 15% of hands)
      *   (b1-b4: bet size vs the pot before it, <=0.4, <=0.7, <=1.1, >1.1)
      */
+
 
 
 
@@ -1634,15 +2034,27 @@
                     if (b) bump(st, 'fbet.' + b, a.type === 'fold');
                     if (checked.has(a.who)) bump(st, 'xr.' + street, a.type === 'raise');
                 }
-                /* Folds count (the HUD definition): without them a check-fold player who bets only real hands read as a
-                   "Maniac" and their raises as wide (live 2026-09-27, 56e22a25: 73% without folds, 44% with). */
-                if (a.type === 'bet' || a.type === 'raise' || a.type === 'call' || a.type === 'fold') bump(st, 'afq', a.type === 'bet' || a.type === 'raise');
+                /* Every post-flop action counts, folds and checks too: without them a check-fold player who bets only real
+                   hands read as a "Maniac" and their raises as wide (live 2026-09-27, 56e22a25: 73% without folds, 20% with all). */
+                bump(st, 'afq', a.type === 'bet' || a.type === 'raise');
                 if (a.type === 'bet') bets++;
                 if (a.type === 'raise') raised = true;
                 if (a.type === 'bet' || a.type === 'raise') aggressive.add(a.who);
                 if (a.type === 'bet' || a.type === 'raise' || a.type === 'call') put.add(a.who);
                 if (a.type === 'check') checked.add(a.who);
                 acted.add(a.who);
+            }
+        }
+
+        /* Preflop only: a post-flop jam from a player pot-committed by a c-bet is not a for-fun shove, and a jammed draw is
+           not junk (debugger review 2026-09-28). Per stake: a $1k habit is not evidence at $50k. */
+        if (bb > 0) {
+            for (const seat of rec.seats) {
+                if (!firstPre.has(seat.name) || !(seat.stackStart >= SHOVER.minBB * bb)) continue;
+                const shove = pre.find((a) => a.who === seat.name && a.allin && (a.type === 'raise' || a.type === 'bet') && a.stackBefore >= SHOVER.minBB * bb);
+                bump(S(seat.name), 'shv:' + bb, !!shove);
+                const cards = rec.shown && rec.shown[seat.name];
+                if (shove && cards && cards.length === 2) bump(S(seat.name), 'shvj:' + bb, isJunk(cards, []));
             }
         }
 
@@ -1864,9 +2276,10 @@
         const ratio = vpip > 0 ? pfr / vpip : 0;
         let type;
         if (hands < 5) type = 'new';
-        /* Post-flop aggression alone never makes a maniac: on Torn it marked limp-everything players whose raises were value (live 2026-09-27). */
-        else if (vpip >= 0.45 && (pfr >= 0.25 || (afq >= 0.55 && pfr >= 0.15))) type = 'maniac';
-        else if (vpip >= 0.45 && ratio < 0.25 && afq < 0.35) type = 'station';
+        /* Only preflop raising makes a maniac: post-flop aggression marked limp-everything players whose raises were value
+           (live 2026-09-27). AFq counts every post-flop action (Torn pool 19%), so a station bets under 15% of them. */
+        else if (vpip >= 0.45 && pfr >= 0.25) type = 'maniac';
+        else if (vpip >= 0.45 && ratio < 0.25 && afq < 0.15) type = 'station';
         else if (vpip >= 0.32 && ratio < 0.45) type = 'fish';
         else if (vpip >= 0.28 && ratio >= 0.45) type = 'lag';
         else if (vpip < 0.18 && ratio < 0.55) type = 'nit';
@@ -2408,7 +2821,7 @@
                 && effBehind >= 100 * s.bb && effBehind >= 6 * winnable) {
                 ev += 0.118 * 0.1 * Math.min(effBehind, 100 * s.bb);
             }
-            actions.push({ id: 'call', label: 'Call', to: matched, amount: callAmt, ev, se: scale(eqNow.eq, sh) * winnable * eqNow.se, allIn });
+            actions.push({ id: 'call', label: 'Call', to: matched, amount: callAmt, ev, se: scale(eqNow.eq, sh) * winnable * eqNow.se, allIn, winnable });
         }
 
         /*
@@ -2482,7 +2895,9 @@
                 cheaper = true;
             }
         }
-        const need = s.toCall > 0 ? callAmt / (s.pot + callAmt) : 0;
+        /* Priced against what hero can win (session 6: "need %" used an uncapped pot). */
+        const callAct = actions.find((a) => a.id === 'call');
+        const need = s.toCall > 0 ? callAmt / Math.max(1, callAct ? callAct.winnable : s.pot + callAmt) : 0;
         const mainOpp = opps.find((o) => o.isAggressor) || opps[0];
         const hands = mainOpp && mainOpp.player ? mainOpp.player.hands : 0;
         const conf = confidenceOf(hands, 10);
@@ -2520,6 +2935,229 @@
         return `Fold equity: everyone folds about ${pctOf(f)} of the time at this size, and you keep ${pctOf(best.eqCont)} when called.`;
     }
 
+    /* ===== src/core/allin-advisor.js ===== */
+    /*
+     * The all-in advisor (release 0.7, docs/plan.md M1). The only spots 0.7 gives a verdict in:
+     * hero must call an all-in, or calling puts hero all-in. Everything else gets exact prices only.
+     *
+     * Each opponent in the pot holds their shover-type mixture (pool.js): P(S) x any two cards plus
+     * (1 - P(S)) x the value range. EV(call) is exact up to Monte Carlo noise: opponent hands are
+     * drawn from those ranges, the board is run out, and every side pot is paid separately.
+     * Because EV is linear in the main shover's P(S), two runs give the whole line and the P(S)
+     * above which calling gains: the per-hand call threshold.
+     */
+
+
+
+    const AI_EPS = 0.005;
+    /* A verdict inside this band (or inside 2 standard errors) is shown as "close: either" (plan: |EV gap| < 0.5 bb). */
+    const CLOSE_BB = 0.5;
+
+    /**
+     * Is hero's decision an all-in one? Pure means nothing can be bet after hero calls: either the call
+     * puts hero all-in, or every opponent who matched the bet is all-in. Players still to act behind are
+     * assumed to fold, and that is said on screen.
+     * @returns {null | { callAmt, heroAllIn, inPot: string[], behind: string[], main: string }}
+     */
+    function allInSpot(hand, heroName, heroStack, toCall) {
+        if (!hand || !heroName || !(toCall > 0) || !(heroStack > 0)) return null;
+        const callAmt = Math.min(toCall, heroStack);
+        const heroAllIn = callAmt >= heroStack - AI_EPS;
+        const inPot = [];
+        const behind = [];
+        let anyAllIn = false;
+        let chipsBehind = false;
+        for (const [name, p] of hand.players) {
+            if (name === heroName || p.folded) continue;
+            const matched = p.allin || p.street >= hand.currentBet - AI_EPS;
+            if (!matched) {
+                behind.push(name);
+                continue;
+            }
+            inPot.push(name);
+            if (p.allin) anyAllIn = true;
+            else chipsBehind = true;
+        }
+        if (!inPot.length) return null;
+        if (!heroAllIn && (!anyAllIn || chipsBehind)) return null;
+        const main = hand.players.get(hand.streetAggressor)?.allin ? hand.streetAggressor
+            : inPot.find((n) => hand.players.get(n).allin) || hand.streetAggressor || inPot[0];
+        return { callAmt, heroAllIn, inPot, behind, main: inPot.includes(main) ? main : inPot[0] };
+    }
+
+    /**
+     * @param {{ hand, heroName, heroCards, board, heroStack, toCall, bb, storeOf: (name) => object|null,
+     *           samples?: number, seed?: number }} a
+     */
+    function adviseAllIn({ hand, heroName, heroCards, board, heroStack, toCall, bb, storeOf, samples = 12000, seed = 1 }) {
+        const spot = allInSpot(hand, heroName, heroStack, toCall);
+        if (!spot) return null;
+        const heroP = hand.players.get(heroName) || { total: 0 };
+        const totals = Object.create(null);
+        for (const [name, p] of hand.players) totals[name] = p.total;
+        totals[heroName] = (heroP.total || 0) + spot.callAmt;
+        const live = new Set([heroName, ...spot.inPot]);
+        const pots = buildPots(totals, live);
+        const winnable = pots.filter((x) => x.eligible.includes(heroName)).reduce((s, x) => s + x.amount, 0);
+        const heroAllInTotal = (heroP.total || 0) + heroStack;
+
+        const opps = spot.inPot.map((name) => {
+            const p = hand.players.get(name);
+            const stackTotal = p.allin ? p.total : p.total + Math.max(0, (p.stackStart ?? Infinity) - p.total);
+            const effBB = Math.min(stackTotal, heroAllInTotal) / Math.max(1, bb);
+            const store = storeOf(name);
+            const post = shoverPosterior(store, bb);
+            /* The cautious read: the same evidence at half weight. The constants are hand-set from 24 shown all-ins, so a
+               call that depends on the read must still gain here (plan: exploit only if it holds at a pessimistic model). */
+            post.pLow = shoverPosterior(store, bb, { weight: 0.5 }).p;
+            const types = typeRanges(board, heroCards, effBB);
+            return { name, post, types, effBB };
+        });
+        const rangesWith = (mainType) => {
+            const out = Object.create(null);
+            for (const o of opps) {
+                if (o.name === spot.main && mainType) out[o.name] = o.types[mainType];
+                else out[o.name] = mixture(o.types.S, o.types.N, o.post.p);
+            }
+            return out;
+        };
+        const run = (mainType, s) => rangeShare({ heroCards, board, pots, hero: heroName, ranges: rangesWith(mainType), samples, seed: s });
+        const vsS = run('S', seed);
+        const vsN = run('N', seed + 1);
+        const main = opps.find((o) => o.name === spot.main);
+        const p = main.post.p;
+        const evS = vsS.won - spot.callAmt;
+        const evN = vsN.won - spot.callAmt;
+        const ev = p * evS + (1 - p) * evN;
+        const se = Math.sqrt((p * vsS.se) ** 2 + ((1 - p) * vsN.se) ** 2);
+        const equity = winnable > 0 ? (p * vsS.won + (1 - p) * vsN.won) / winnable : 0;
+        const need = winnable > 0 ? spot.callAmt / winnable : 1;
+
+        /* The P(S) above which a call gains, against this hand's cards and this pot. */
+        let threshold;
+        if (evS > 0 && evN > 0) threshold = { kind: 'always' };
+        else if (evS <= 0 && evN <= 0) threshold = { kind: 'never' };
+        else threshold = { kind: 'at', p: Math.min(1, Math.max(0, -evN / (evS - evN))), rising: evS > evN };
+
+        const pLow = main.post.p >= main.post.prior ? main.post.pLow : main.post.p;
+        const pHigh = main.post.p >= main.post.prior ? main.post.p : main.post.pLow;
+        const evCautious = Math.min(pLow * evS + (1 - pLow) * evN, pHigh * evS + (1 - pHigh) * evN);
+        const close = Math.abs(ev) < CLOSE_BB * bb || Math.abs(ev) < 2 * se;
+        /* A call that gains at the read but not at the cautious read is shown as close: the stack rides on a thin read. */
+        const readRisk = !close && ev > 0 && evCautious < 0;
+        const verdict = close || readRisk ? 'close' : ev > 0 ? 'call' : 'fold';
+        const warnings = [];
+        if (spot.behind.length) warnings.push(`${spot.behind.length} player${spot.behind.length > 1 ? 's' : ''} still to act (${spot.behind.join(', ')}): priced as if they fold. A call behind you makes this worse.`);
+        return {
+            kind: 'allin', verdict, ev, se, evS, evN, equity, need, winnable, callAmt: spot.callAmt, heroAllIn: spot.heroAllIn,
+            main: spot.main, p, pLow, pHigh, evCautious, readRisk, post: main.post, threshold, depth: main.types.depth, effBB: main.effBB,
+            opponents: opps.map((o) => ({ name: o.name, p: o.post.p, hands: o.post.hands, shoves: o.post.shoves, shown: o.post.shown, junk: o.post.junk, prior: o.post.prior })),
+            behind: spot.behind, warnings, pots: pots.length, samples,
+        };
+    }
+
+    /**
+     * The price of hero's own shove, short-stacked (<= 25 bb): what hero has when called by the value
+     * range, and the fold rate at which the shove breaks even. A price, not a verdict: 0.7 has no
+     * fold model it trusts.
+     */
+    function shovePrice({ hand, heroName, heroCards, board, heroStack, bb, pot, samples = 8000, seed = 3 }) {
+        if (!hand || !(heroStack > 0) || !bb) return null;
+        const heroP = hand.players.get(heroName) || { total: 0, street: 0 };
+        const heroTotal = (heroP.total || 0) + heroStack;
+        /* Someone already all-in is dead money hero can win without them folding: this simple price does not hold. */
+        if ([...hand.players.entries()].some(([n, p]) => n !== heroName && !p.folded && p.allin)) return null;
+        const opps = [...hand.players.entries()].filter(([n, p]) => n !== heroName && !p.folded);
+        if (!opps.length) return null;
+        const deepest = Math.max(...opps.map(([, p]) => (p.stackStart ?? 0)));
+        const effBB = Math.min(heroTotal, deepest || heroTotal) / bb;
+        if (effBB > 25) return null;
+        const [vName, vP] = opps.reduce((a, b) => ((b[1].stackStart ?? 0) > (a[1].stackStart ?? 0) ? b : a));
+        const totals = Object.create(null);
+        for (const [name, p] of hand.players) totals[name] = p.total;
+        totals[heroName] = heroTotal;
+        totals[vName] = Math.min(heroTotal, vP.stackStart ?? heroTotal);
+        const pots = buildPots(totals, new Set([heroName, vName]));
+        const { N } = typeRanges(board, heroCards, effBB);
+        const r = rangeShare({ heroCards, board, pots, hero: heroName, ranges: { [vName]: N }, samples, seed });
+        const whenCalled = r.won - heroStack;
+        const breakEven = whenCalled >= 0 ? 0 : -whenCalled / (pot - whenCalled);
+        const winnable = pots.filter((x) => x.eligible.includes(heroName)).reduce((s, x) => s + x.amount, 0);
+        return { effBB, whenCalled, breakEven, equity: winnable > 0 ? r.won / winnable : 0, caller: vName };
+    }
+
+    /* ===== src/core/madehand.js ===== */
+    /*
+     * The made-hand label (docs/plan.md M1): what hero holds right now, in words. Session 6 had a
+     * wheel folded on the river because nothing on screen said "straight".
+     */
+
+
+
+    const MH_B4 = 28561;
+    const MH_B3 = 2197;
+    const MH_B5 = 371293;
+    const RANK_WORD = ['2', '3', '4', '5', '6', '7', '8', '9', 'Ten', 'Jack', 'Queen', 'King', 'Ace'];
+    const RANK_PLURAL = ['2s', '3s', '4s', '5s', '6s', '7s', '8s', '9s', 'Tens', 'Jacks', 'Queens', 'Kings', 'Aces'];
+    const RANK_SHORT = '23456789TJQKA';
+
+    /**
+     * @param {number[]} hero  two cards
+     * @param {number[]} board 0, 3, 4 or 5 cards
+     * @returns {{ text: string, category: number, board: boolean } | null}  board = the made part is all on the board
+     */
+    function madeHand(hero, board = []) {
+        if (!hero || hero.length !== 2) return null;
+        if (!board.length) {
+            const [a, b] = hero.map(rankOf).sort((x, y) => y - x);
+            if (a === b) return { text: `Pocket ${RANK_PLURAL[a]}`, category: 1, board: false };
+            return { text: `${RANK_SHORT[a]}${RANK_SHORT[b]} ${suitOf(hero[0]) === suitOf(hero[1]) ? 'suited' : 'offsuit'}`, category: 0, board: false };
+        }
+        const score = evaluate([...hero, ...board]);
+        const cat = categoryOf(score);
+        const r1 = Math.floor((score % MH_B5) / MH_B4);
+        const r2 = Math.floor((score % MH_B4) / MH_B3);
+        const onBoard = (rank, n) => board.filter((c) => rankOf(c) === rank).length >= n;
+        let text;
+        let fromBoard = false;
+        switch (cat) {
+            case 8:
+                text = r1 === 12 ? 'Royal flush' : `Straight flush, ${RANK_WORD[r1]}-high`;
+                break;
+            case 7:
+                text = `Four of a kind, ${RANK_PLURAL[r1]}`;
+                fromBoard = onBoard(r1, 4);
+                break;
+            case 6:
+                text = `Full house, ${RANK_PLURAL[r1]} full of ${RANK_PLURAL[r2]}`;
+                fromBoard = onBoard(r1, 3) && onBoard(r2, 2);
+                break;
+            case 5:
+                text = `Flush, ${RANK_WORD[r1]}-high`;
+                break;
+            case 4:
+                text = r1 === 3 ? 'Straight, 5-high (wheel)' : `Straight, ${RANK_WORD[r1]}-high`;
+                break;
+            case 3:
+                text = `Three of a kind, ${RANK_PLURAL[r1]}`;
+                fromBoard = onBoard(r1, 3);
+                break;
+            case 2:
+                text = `Two pair, ${RANK_PLURAL[r1]} and ${RANK_PLURAL[r2]}`;
+                fromBoard = onBoard(r1, 2) && onBoard(r2, 2);
+                break;
+            case 1:
+                text = `Pair of ${RANK_PLURAL[r1]}`;
+                fromBoard = onBoard(r1, 2);
+                break;
+            default:
+                fromBoard = !hero.some((c) => rankOf(c) >= r1);
+                text = fromBoard ? `No pair (the board's ${RANK_WORD[r1] === 'Ace' ? 'ace' : RANK_WORD[r1].toLowerCase()} is high)` : `No pair, ${RANK_WORD[r1]}-high`;
+        }
+        if (board.length === 5 && (cat === 4 || cat === 5 || cat === 8) && evaluate(board) === score) fromBoard = true;
+        return { text: fromBoard && cat > 0 ? `${text} (on the board)` : text, category: cat, board: fromBoard };
+    }
+
     /* ===== src/core/advisor.js ===== */
     /*
      * Advisor: keeps every opponent's range up to date through the hand and turns
@@ -2530,6 +3168,8 @@
      * call is the Call button's label when present, otherwise the log. When the
      * two disagree the label wins and the advice says so.
      */
+
+
 
 
 
@@ -2568,6 +3208,9 @@
         let ranges = new Map();
         let seen = 0;
         let acted = new Set();
+        /* The all-in verdict of one spot, computed once. precompute fills it when the shove's log line appears, so hero's
+           turn is a lookup (M1 latency: 2 x 12k runouts of a multiway flop all-in can take ~100 ms). */
+        let allinMemo = { key: '', value: null };
 
         function reset(id) {
             gameId = id;
@@ -2639,13 +3282,14 @@
         }
 
         /**
+         * opts.precompute: off hero's turn, only fill the all-in memo (the log's figure stands in for the Call button).
          * @returns {{ advice?: object, blocked?: string[], inputs?: object }}
          */
-        function advise(hand, snap, settings = {}) {
+        function advise(hand, snap, settings = {}, opts = {}) {
             const blocked = [];
             if (!snap || !snap.hero) blocked.push('Your seat is not found yet (sit at a table)');
             if (snap && snap.hero && !snap.heroCards) blocked.push('Your cards are not visible yet');
-            if (snap && snap.hero && !snap.heroTurn) blocked.push('Waiting for your turn');
+            if (snap && snap.hero && !snap.heroTurn && !opts.precompute) blocked.push('Waiting for your turn');
             /* Without the name, hero's own log rows would be priced as an opponent's (debugger review). */
             if (snap && snap.hero && !snap.hero.name) blocked.push('Your Torn name is not known yet: it shows after your first action at this table');
             if (!hand) blocked.push('Waiting for the next hand to start');
@@ -2657,6 +3301,8 @@
             const heroP = hand.players.get(heroName) || { street: 0, total: 0 };
             /* An all-in run-out has no decision; one was journaled on the river of 56e22a25 (live 2026-09-27). */
             if (heroP.allin) return { blocked: ['You are all-in'] };
+            /* Session 6: advice appeared after hero folded and was journaled with nothing taken. */
+            if (heroP.folded || snap.seats.some((x) => x.self && x.folded)) return { blocked: ['You folded this hand'] };
             const street = hand.street;
             const board = snap.board.length === BOARD_LEN[street] ? snap.board : hand.board.slice(0, BOARD_LEN[street]);
             const bb = hand.bb || 0;
@@ -2664,7 +3310,7 @@
 
             const logToCall = Math.max(0, hand.currentBet - heroP.street);
             /* The button is the check, the log is the exact figure: labels round to $0.1k once they reach $1k. */
-            const label = snap.units === 'bb' ? null : snap.toCallLabel ?? null;
+            const label = snap.units === 'bb' || opts.precompute ? null : snap.toCallLabel ?? null;
             const agrees = label !== null && Math.abs(label - logToCall) <= (snap.toCallTol || 0) + 0.5;
             const toCall = label === null || agrees ? logToCall : label;
             const toCallSource = label === null ? 'the log' : agrees ? 'log, checked with Call button' : "Torn's Call button";
@@ -2714,6 +3360,46 @@
             const mainLabel = pos ? pos.labels.get(idx(main.name)) : null;
             const inPosition = heroLabel && mainLabel ? isInPosition(heroLabel, mainLabel, occupied.length) : false;
 
+            /* Exact prices. A call can only win what is matched: chips others put in beyond hero's call are not in play for hero. */
+            const callAmt = Math.min(toCall, heroStack);
+            const heroTotal = (heroP.total || 0) + callAmt;
+            let logPot = 0;
+            let capped = 0;
+            for (const [name, p] of hand.players) {
+                if (name === heroName) continue;
+                logPot += p.total;
+                capped += Math.min(p.total, heroTotal);
+            }
+            /* Torn's POT figure is the base; only what lies beyond hero's reach (anyone's chips above hero's total, folded
+               players' included) comes off. */
+            const winnable = pot - (logPot - capped) + callAmt;
+            const price = { toCall, callAmt, pot, winnable, need: toCall > 0 ? callAmt / winnable : 0, spr: pot > 0 ? Math.min(heroStack, Math.max(0, ...opponents.map((o) => o.stack))) / pot : null };
+            const made = madeHand(heroCards, board);
+            const common = { heroLabel, positionCertainty: pos ? pos.certainty : 'unknown', toCall, toCallSource, pot, warnings, price, made, street };
+
+            const samples = Math.min(settings.samples || 12000, 16000);
+            const memoKey = [hand.gameId, hand.actions.length, board.join(), heroCards.join(), toCall, heroStack, bb, samples].join('|');
+            if (toCall > 0 && allinMemo.key !== memoKey) {
+                allinMemo = {
+                    key: memoKey,
+                    value: adviseAllIn({
+                        hand, heroName, heroCards, board, heroStack, toCall, bb, storeOf: (name) => storeOf(hand, name),
+                        samples, seed: (hand.actions.length + 1) * 7919,
+                    }),
+                };
+            }
+            if (opts.precompute) return { blocked: ['Precomputed'] };
+            const allin = toCall > 0 && allinMemo.value ? { ...allinMemo.value, warnings: [...allinMemo.value.warnings] } : null;
+            if (allin) {
+                const unseated = snap.seats.filter((x) => !x.empty && x.name && !x.self && !x.folded && !hand.players.has(x.name) && !/sit|wait/i.test(x.stateText || '')).map((x) => x.name);
+                if (unseated.length) allin.warnings.push(`${unseated.join(', ')} ${unseated.length > 1 ? 'have' : 'has'} not acted yet: priced as if they fold.`);
+                return { advice: { ...common, mode: 'allin', allin }, inputs: { gameId: hand.gameId, i: hand.actions.length, street, toCall, pot, heroStack, board } };
+            }
+            const shove = street === 'preflop' ? shovePrice({ hand, heroName, heroCards, board, heroStack, bb, pot }) : null;
+            if (!settings.legacy) {
+                return { advice: { ...common, mode: 'prices', shove, chart: pushFoldHint(hand, snap, heroP, heroLabel, opponents, bb, heroCards) }, inputs: { gameId: hand.gameId, i: hand.actions.length, street, toCall, pot, heroStack, board } };
+            }
+
             const input = {
                 hero: heroCards, board, street, pot, toCall, heroStreet: heroP.street, heroStack,
                 currentBet: hand.currentBet, lastIncrement: hand.lastIncrement, bb,
@@ -2730,7 +3416,7 @@
             }
             const chart = pushFoldHint(hand, snap, heroP, heroLabel, opponents, bb, heroCards);
             return {
-                advice: { ...advice, baseline, chart, warnings, heroLabel, inPosition, positionCertainty: pos ? pos.certainty : 'unknown', toCall, toCallSource, pot, main: main.name, mainType: main.type },
+                advice: { ...advice, ...common, mode: 'legacy', shove, baseline, chart, inPosition, main: main.name, mainType: main.type },
                 inputs: { gameId: hand.gameId, i: hand.actions.length, street, toCall, pot, heroStack, board, opponents: opponents.map((o) => ({ name: o.name, type: o.type.type, hands: o.type.hands })) },
             };
         }
@@ -2766,7 +3452,8 @@
         }
         const names = new Set(o.seats.map((s) => s.name));
         if (!Array.isArray(o.actions) || !Array.isArray(o.board) || !Array.isArray(o.posts || [])) return false;
-        for (const a of o.actions) if (!isObj(a) || !names.has(a.who) || typeof a.type !== 'string' || typeof a.street !== 'string') return false;
+        const STREETS = new Set(['preflop', 'flop', 'turn', 'river']);
+        for (const a of o.actions) if (!isObj(a) || !names.has(a.who) || typeof a.type !== 'string' || !STREETS.has(a.street)) return false;
         for (const m of [o.net, o.shown || {}]) {
             if (!isObj(m)) return false;
             for (const k of Object.keys(m)) if (!names.has(k)) return false;
@@ -2779,6 +3466,13 @@
         for (const c of Object.values(o.shown || {})) if (!Array.isArray(c) || !c.every(card)) return false;
         if (!(o.posts || []).every((p) => isObj(p) && names.has(p.who) && num(p.amount))) return false;
         if (!o.actions.every((a) => numOrNull(a.added) && numOrNull(a.toAmount) && numOrNull(a.stackBefore))) return false;
+        /* v2 (0.7): timing per action, stake tag and players dealt in. v1 files have none of these and still import. */
+        if (o.v !== undefined && o.v !== 1 && o.v !== 2) return false;
+        const boolOrNone = (x) => x === undefined || typeof x === 'boolean';
+        if (!o.actions.every((a) => numOrNull(a.tSeen) && numOrNull(a.tTurn) && boolOrNone(a.batch) && boolOrNone(a.seenLive)
+            && (a.vis === undefined || a.vis === null || a.vis === 'visible' || a.vis === 'hidden'))) return false;
+        if (o.stake !== undefined && o.stake !== null && !(typeof o.stake === 'string' && /^[0-9.]{1,6}[kmb]?$|^bb$/.test(o.stake))) return false;
+        if (o.dealt !== undefined && !(Number.isInteger(o.dealt) && o.dealt >= 0 && o.dealt <= 10)) return false;
         if (!(o.winners || []).every((w) => isObj(w) && names.has(w.who) && num(w.amount))) return false;
         if (!(o.uncalled || []).every((u) => isObj(u) && names.has(u.who) && num(u.amount))) return false;
         if (!numOrNull(o.t0) || !numOrNull(o.t1)) return false;
@@ -2790,6 +3484,8 @@
 
     function validDecision(o) {
         if (!isObj(o) || typeof o.id !== 'string' || o.id.length >= 80 || !isObj(o.advice)) return false;
+        /* A journal entry is a few hundred bytes; a huge one from a file is not ours (SAST 2026-09-28). */
+        if (JSON.stringify(o).length > 8000) return false;
         if (!validAction(o.advice.best) || !Array.isArray(o.advice.actions) || !o.advice.actions.every(validAction)) return false;
         if (o.taken !== null && o.taken !== undefined && !(isObj(o.taken) && typeof o.taken.type === 'string' && numOrNull(o.taken.toAmount))) return false;
         return numOrNull(o.bb) && (o.street === undefined || typeof o.street === 'string');
@@ -3264,8 +3960,9 @@
                 const keys = rows.map((r) => r.key);
                 if (prev === null) {
                     prev = keys;
+                    /* Marked `replay`: these rows were already on the page, so their timing is not live (HandRecord v2). */
                     for (let i = rows.length - 1; i >= 0; i--) {
-                        if (/^game$/i.test(rows[i].actor || '') && /\bstarted\b/i.test(rows[i].text || '')) return rows.slice(i);
+                        if (/^game$/i.test(rows[i].actor || '') && /\bstarted\b/i.test(rows[i].text || '')) return Object.assign(rows.slice(i), { replay: true });
                     }
                     return [];
                 }
@@ -3340,6 +4037,13 @@
     .verdict.call .act { color: var(--blue); }
     .verdict.marginal { border-color: var(--amber); background: var(--amber-bg); }
     .verdict.kept { opacity: .55; }
+    .verdict.prices { background: rgba(255,255,255,.03); border-color: var(--line2); }
+    .verdict.prices .act { font-size: 16px; font-weight: bold; color: var(--text); }
+    .verdict.prices .alt { color: var(--muted); }
+    .verdict.legacy .act { font-size: 16px; color: #cfcfcf; }
+    .verdict .sure { font-size: 12px; color: var(--text); margin-top: 6px; }
+    .verdict .sure.warn { color: var(--amber); margin-top: 2px; }
+    .made { font-size: 13px; } .made b { color: #fff; }
     .verdict .act { font-size: 22px; font-weight: 900; color: var(--green); letter-spacing: .3px; font-variant-numeric: tabular-nums; }
     .verdict .alt { font-size: 12px; color: #cfe6a0; margin-top: 2px; }
     .verdict .evline { display: flex; justify-content: space-between; margin-top: 10px; font-size: 12px; gap: 8px; flex-wrap: wrap; }
@@ -3397,12 +4101,14 @@
     .cards { display: inline-flex; gap: 2px; vertical-align: middle; }
 
     /* seat tiles */
-    .tile { position: fixed; width: 132px; background: rgba(12,12,12,.92); border: 1px solid #333; border-radius: 8px; padding: 4px 6px; display: flex; flex-direction: column; gap: 3px; font-size: 11px; pointer-events: none; transition: opacity .2s; }
+    .tile { position: fixed; width: 132px; background: rgba(12,12,12,.92); border: 1px solid #333; border-radius: 8px; padding: 3px 6px; display: flex; flex-direction: column; gap: 2px; font-size: 12px; pointer-events: none; transition: opacity .2s; }
     .tile .t { display: flex; justify-content: space-between; gap: 4px; align-items: center; }
     .tile.faded { opacity: .4; }
     .tile.hot { width: 172px; border-color: var(--amber); background: rgba(30,22,6,.95); }
     .tile.hot .rd { color: #f5d68a; }
-    .tile .fm { font-size: 11px; line-height: 1.25; color: var(--amber); margin-top: 3px; white-space: pre-line; }
+    .tile .l2 { font-size: 12px; line-height: 1.25; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .tile .l2.warn { color: var(--amber); }
+    .tile.hot .l2 { color: #f5d68a; }
     .conf { height: 3px; border-radius: 2px; background: #2a2a2a; overflow: hidden; }
     .conf i { display: block; height: 100%; background: var(--muted); }
     .rbar { position: relative; height: 6px; background: #2a2a2a; border-radius: 3px; }
@@ -3600,15 +4306,18 @@
                 ],
             },
             {
-                id: 'advice', title: 'Advice', status: `${s.mode === 'learn' ? 'Learn' : 'Quick'} · ${s.exploit[0].toUpperCase() + s.exploit.slice(1)}`, dot: 'on',
+                id: 'advice', title: 'Advice', status: `${s.mode === 'learn' ? 'Learn' : 'Quick'} · ${s.legacy ? 'legacy on' : 'all-in only'}`, dot: s.legacy ? 'warn' : 'on',
                 lead: 'What the advice shows and how hard it leans on reads.',
                 body: [
+                    field('Verdicts', '0.7 rates only what it can price exactly',
+                        check(s.legacy, "Also show 0.6's advice outside all-in spots (legacy, unrated)", (v) => set({ legacy: v }), 'ttm-legacy'),
+                        el('p', { class: 'muted', text: "Off (the default): a verdict only when you face an all-in or a call puts you all-in; everything else gets exact prices and your made hand. On: 0.6's engine answers the rest. It lost money in raise wars and has not been re-rated, so treat it as a second opinion." })),
                     field('Mode', 'Quick: action and size. Learn: the why.', seg(s.mode, [['quick', 'Quick'], ['learn', 'Learn']], (v) => set({ mode: v }))),
                     field('Amounts in', null, seg(s.units, [['$', 'Dollars'], ['bb', 'Big blinds']], (v) => set({ units: v }))),
-                    field('Exploit strength', 'How much a read can move the advice',
+                    field('Exploit strength', 'Legacy advice only: how much a read can move it',
                         seg(s.exploit, [['off', 'Off'], ['capped', 'Capped'], ['full', 'Full']], (v) => set({ exploit: v })),
                         el('p', { class: 'muted', text: 'Capped: a read with few hands behind it moves the advice only a little, and the pool baseline is shown when they differ.' })),
-                    field('Accuracy', 'Samples after the flop', seg(s.samples, [[2000, 'Fast 2k'], [10000, 'Normal 10k'], [25000, 'Max 25k']], (v) => set({ samples: v })),
+                    field('Accuracy', 'Samples per estimate', seg(s.samples, [[2000, 'Fast 2k'], [10000, 'Normal 10k'], [25000, 'Max 25k']], (v) => set({ samples: v })),
                         el('p', { class: 'muted', text: 'Preflop heads-up uses an exact table and needs no samples.' })),
                     field('Show', null, check(s.showEv, 'EV of every action', (v) => set({ showEv: v }), 'ttm-ev'), check(s.showRange, "The opponent's estimated range", (v) => set({ showRange: v }), 'ttm-range'),
                         check(s.selfForm, 'A note when my own play drifts from my usual (for example after a big loss)', (v) => set({ selfForm: v }), 'ttm-self')),
@@ -3911,6 +4620,16 @@
      */
 
 
+    function latencyRows(l) {
+        const ms = (x) => (x === null || x === undefined ? '?' : x < 10 ? x.toFixed(1) + ' ms' : Math.round(x) + ' ms');
+        const row = (label, st) => [label, st ? `${ms(st.p50)} · ${ms(st.p95)} · ${ms(st.max)} (n=${st.n})` : 'not measured yet'];
+        if (!l) return [['Latency', 'not measured yet']];
+        return [
+            row('Page read', l.tick), row('Log line', l.row), row('Advice', l.decision), row('Your turn → advice', l.turn),
+            ['Long tasks', l.longTasks === null ? 'not supported in this browser' : `${l.longTasks}${l.longTasks ? ` (worst ${ms(l.longMaxMs)})` : ''}`],
+        ];
+    }
+
     function buildCalibrationView({ actions, info }) {
         const kv = (rows) => el('div', { class: 'kv' }, rows.flatMap(([k, v]) => [el('div', { class: 'k', text: k }), el('div', { text: String(v) })]));
         const snapOut = el('span', { class: 'muted' });
@@ -3962,6 +4681,11 @@
                 reportBox,
             ]),
             el('div', { class: 'ssec' }, [
+                el('h2', { text: 'Speed' }),
+                el('p', { class: 'lead', text: 'Measured on this page since it loaded (median, 95th percentile, worst). Targets from 1.0: your turn ≤ 150 ms, a log line ≤ 16 ms, no long task over 50 ms.' }),
+                kv(latencyRows(info.latency)),
+            ]),
+            el('div', { class: 'ssec' }, [
                 el('h2', { text: 'Recent log lines' }),
                 el('p', { class: 'lead', text: 'Each line and what it was read as. Unknown lines are kept so a pattern can be added.' }),
                 el('pre', { class: 'log', text: info.recent.join('\n') || '(nothing yet)' }),
@@ -3985,6 +4709,19 @@
 
 
     const LABELS = { fold: 'FOLD', check: 'CHECK', call: 'CALL', bet: 'BET', raise: 'RAISE TO', allin: 'ALL-IN' };
+
+    /* "< 1%" rather than "0%" for a sliver that is not nothing (session 5/6). */
+    const pctText = (x, d = 0) => (x > 0 && x < 0.005 ? '< 1%' : (x * 100).toFixed(d) + '%');
+
+    /* The short verdict for the collapsed title and the bubble, whatever the mode. */
+    function shortVerdict(a, units, bb) {
+        if (!a) return '';
+        const amt = (x) => (units === 'bb' && bb ? money(x / bb, 'bb') : money(x));
+        if (a.mode === 'allin') return a.allin.verdict === 'close' ? 'CLOSE: EITHER' : a.allin.verdict === 'call' ? (a.allin.heroAllIn ? 'CALL ALL-IN' : `CALL ${amt(a.allin.callAmt)}`) : 'FOLD';
+        if (a.mode === 'prices') return a.price && a.price.toCall > 0 ? `Need ${pctText(a.price.need, 1)} · ${amt(a.price.callAmt)}` : '';
+        if (a.closeEither) return 'CLOSE: EITHER';
+        return a.best ? verdictText(a.best, units, bb) : '';
+    }
 
     function verdictText(best, units, bb) {
         const kind = String(best.id).split(':')[0];
@@ -4024,6 +4761,9 @@
         const reminder = el('div', { class: 'preminder hidden' });
         box.append(title, passNote, status, reminder, body, foot, wide);
         let clearKey = '';
+        let avoidKey = '';
+        /* The height limit from avoidTable(); keepClear() starts from it instead of the stylesheet's. */
+        let baseMax = '';
         root.appendChild(box);
 
         let view = 'table';
@@ -4202,15 +4942,19 @@
                 return;
             }
             const a = result.advice;
+            if (a.mode === 'allin') return renderAllIn(a, ctx, fmt, bb);
+            if (a.mode === 'prices') return renderPrices(a, ctx, fmt, bb);
             const kind = String(a.best.id).split(':')[0];
-            const verdict = verdictText(a.best, units, bb);
+            /* The verdict states its confidence (plan M1): a gap under 0.5 bb is "close: either", not a hard call. */
+            a.closeEither = !!a.second && Math.abs(a.best.ev - a.second.ev) < 0.5 * (bb || 1);
+            const verdict = (a.closeEither ? `CLOSE: ${verdictText(a.best, units, bb)} or ${verdictText(a.second, units, bb).toLowerCase()}` : verdictText(a.best, units, bb)) + ' · unrated';
             /*
              * A kept decision (not hero's turn any more, a later street or hand than it was computed for:
              * live report 2026-09-27) must not read as live advice: no collapsed-title verdict, and the
              * card is labelled and dimmed instead of saying "Advice".
              */
             const kept = !!(ctx && ctx.kept);
-            cverdict.textContent = kept ? '' : `${verdict.replace('RAISE TO ', 'RAISE ')} · ${signedBb(a.best.ev / bb).replace(/\s*bb$/, '')}`;
+            cverdict.textContent = kept ? '' : a.closeEither ? 'CLOSE: EITHER' : `${verdict.replace('RAISE TO ', 'RAISE ')} · ${signedBb(a.best.ev / bb).replace(/\s*bb$/, '')}`;
             const alt = a.cheaper && a.second
                 ? `Close call: ${verdictText(a.second, units, bb).toLowerCase()} scores ${signedBb(a.second.ev / bb)}, inside the noise. This risks less.`
                 : a.marginal && a.second
@@ -4218,12 +4962,13 @@
                 : a.baseline ? `Pool baseline says ${verdictText(a.baseline, units, bb).toLowerCase()}; the read on ${a.main} changes it.` : '';
             const others = a.ranked.filter((x) => x !== a.best).slice(0, 2).map((x) => `${x.label}${x.to && x.id !== 'call' ? ' ' + fmt(x.to) : ''} ${signedBb(x.ev / bb)}`).join(' · ');
             const keptStreet = kept && ctx.keptStreet ? ctx.keptStreet[0].toUpperCase() + ctx.keptStreet.slice(1) : '';
-            body.appendChild(el('div', { class: 'verdict ' + (a.marginal ? 'marginal ' : '') + kind + (kept ? ' kept' : '') }, [
-                el('div', { class: 'lbl', text: kept ? `Last decision · ${keptStreet}` : 'Advice' }),
+            body.appendChild(el('div', { class: 'verdict legacy ' + (a.marginal || a.closeEither ? 'marginal ' : '') + kind + (kept ? ' kept' : '') }, [
+                el('div', { class: 'lbl', text: kept ? `Last decision · ${keptStreet}` : 'Legacy advice · unrated' }),
                 el('div', { class: 'act', text: verdict }),
                 alt ? el('div', { class: 'alt' + (a.cheaper ? '' : ' learn-only'), text: alt }) : null,
                 el('div', { class: 'evline' }, [el('span', {}, ['EV ', el('b', { class: 'num', text: signedBb(a.best.ev / bb) })]), el('span', { class: 'dim learn-only', text: others })]),
             ]));
+            madeLine(a.made);
             const eqPct = (a.equity.eq * 100).toFixed(1);
             /*
              * A call is credited R x equity (R < 1 when chips stay behind), so the raw price alone read as a contradiction:
@@ -4235,11 +4980,11 @@
             const needPct = (needEff * 100).toFixed(1);
             body.appendChild(el('div', { class: 'eqwrap' }, [
                 el('div', { class: 'lbls' }, [
-                    el('span', { class: 'learn-only' }, ['Equity ', el('b', { class: 'num', text: eqPct + '%' }), a.equity.se ? el('span', { class: 'dim', text: ' ±' + (a.equity.se * 100).toFixed(1) }) : null]),
+                    el('span', { class: 'learn-only' }, ['Equity ', el('b', { class: 'num', text: eqPct + '%' }), a.equity.se ? el('span', { class: 'dim', text: ' ±' + (a.equity.se * 100).toFixed(1) }) : null, el('span', { class: 'dim', text: ' vs legacy ranges' })]),
                     el('span', { class: 'quick-only' }, ['Equity ', el('b', { class: 'num', text: Math.round(a.equity.eq * 100) + '%' })]),
-                    el('span', { class: 'dim', title: R < 1 ? `Price ${(a.need * 100).toFixed(1)}%. With chips behind you win about ${Math.round(R * 100)}% of your equity (position, later streets), so you need ${needPct}%.` : '', text: a.toCall > 0 ? `need ${needPct}% to call ${fmt(a.toCall)}` : 'nothing to call' }),
+                    el('span', { class: 'dim', title: R < 1 ? `Price ${(a.need * 100).toFixed(1)}%. With chips behind you win about ${Math.round(R * 100)}% of your equity (position, later streets), so you need ${needPct}%.` : '', text: a.toCall > 0 ? `need ${pctText(a.need, 1)} to call ${fmt(a.toCall)}` : 'nothing to call' }),
                 ]),
-                R < 1 && a.toCall > 0 ? el('div', { class: 'dim learn-only', style: { fontSize: '12px' }, text: `Price ${(a.need * 100).toFixed(1)}% · you keep about ${Math.round(R * 100)}% of your equity with chips behind` }) : null,
+                R < 1 && a.toCall > 0 ? el('div', { class: 'dim learn-only', style: { fontSize: '12px' }, text: `After realisation (you keep about ${Math.round(R * 100)}% of your equity with chips behind): ${needPct}%` }) : null,
                 el('div', { class: 'eqbar' }, [el('i', { style: { width: eqPct + '%' } }), a.toCall > 0 ? el('b', { style: { left: needPct + '%' } }) : null]),
             ]));
             for (const w of a.warnings || []) body.appendChild(el('div', { class: 'note-warn', text: w }));
@@ -4265,7 +5010,7 @@
                 const k = String(x.id).split(':')[0];
                 if (k === 'fold') return 'Fold: nothing more goes in. Chips already in the pot are gone either way.';
                 if (k === 'check') return `Check: free. You win ${pct(a.equity.eq)} of the time, worth ${sm(x.ev)} on average.`;
-                if (k === 'call') return `Call ${fmt(x.amount)} to win a ${fmt(a.pot)} pot: you need ${pct(needEff)}${R < 1 ? ` (price ${pct(a.need)}, keeping about ${pct(R)} of your equity)` : ''}, you have ${pct(a.equity.eq)}. Average result ${sm(x.ev)}.`;
+                if (k === 'call') return `Call ${fmt(x.amount)} to win ${fmt(a.price ? a.price.winnable : a.pot)}: you need ${pct(needEff)}${R < 1 ? ` (price ${pct(a.need)}, keeping about ${pct(R)} of your equity)` : ''}, you have ${pct(a.equity.eq)}. Average result ${sm(x.ev)}.`;
                 const put = fmt(x.amount);
                 const folds = x.pAllFold ?? 0;
                 const called = x.whenCalled !== undefined && x.whenCalled !== null
@@ -4285,13 +5030,128 @@
                 el('h3', {}, ['Why · ' + a.main + ' ', t ? el('span', { class: 'pill ' + t.type, text: t.label }) : null,
                     t && t.hands ? el('span', { class: 'dim num', style: { fontWeight: 'normal' }, text: `${Math.round(t.vpip * 100)}/${Math.round(t.pfr * 100)} · ${t.hands} hands` }) : null]),
                 el('div', { style: { fontSize: '12px' }, text: a.reason }),
-                s.showRange && a.range ? el('div', { class: 'range', text: `Range now ≈ ${Math.round(a.range.fraction * 100)}% of hands: ${a.range.text}` }) : null,
+                s.showRange && a.range ? el('div', { class: 'range', text: `Range now ${a.range.fraction < 0.005 ? '' : '≈ '}${pctText(a.range.fraction)} of hands: ${a.range.text}` }) : null,
                 el('div', { class: 'range', text: (a.confidence.hands ? `Confidence ${a.confidence.label.toLowerCase()} · ${a.confidence.hands} hands on ${a.main}` : `No hands on ${a.main} yet, so this uses the Torn pool average`) + (a.heroLabel ? ` · you are ${a.heroLabel}` : '') }),
             ]));
             if (ctx && ctx.selfNote) body.appendChild(el('div', { class: 'note-self' }, [el('b', { text: '! ' }), ctx.selfNote]));
-            const price = a.toCall <= 0 ? '' : ctx.toCallSource === 'log, checked with Call button' ? ' · price matches Torn ✓' : ctx.toCallSource === 'the log' ? ' · price from the log' : " · price from Torn's button";
             const method = a.equity.method === 'monte-carlo' ? Math.round(a.equity.n / 1000) + 'k samples' : a.equity.method;
-            foot.textContent = `Pot ${fmt(a.pot)}${price} · ${method}`;
+            footer(a, method);
+            applyMode();
+        }
+
+        function madeLine(made) {
+            /* Visible in Quick mode too (session 6: a wheel folded because nothing said "straight"). */
+            if (!made) return;
+            body.appendChild(el('div', { class: 'made' }, [el('span', { class: 'lbl', text: 'You have ' }), el('b', { text: made.text })]));
+        }
+
+        function selfNote(ctx) {
+            if (ctx && ctx.selfNote && !ctx.kept) body.appendChild(el('div', { class: 'note-self' }, [el('b', { text: '! ' }), ctx.selfNote]));
+        }
+
+        function keptLabel(ctx, live) {
+            const kept = !!(ctx && ctx.kept);
+            const street = kept && ctx.keptStreet ? ctx.keptStreet[0].toUpperCase() + ctx.keptStreet.slice(1) : '';
+            return { kept, text: kept ? `Last decision · ${street}` : live };
+        }
+
+        function footer(a, extra) {
+            const price = a.toCall <= 0 ? '' : a.toCallSource === 'log, checked with Call button' ? ' · price matches Torn ✓' : a.toCallSource === 'the log' ? ' · price from the log' : " · price from Torn's button";
+            foot.textContent = `Pot ${money(a.pot)}${price}${extra ? ' · ' + extra : ''} · v${version}`;
+        }
+
+        /* 0.7's one verdict: an all-in call, priced exactly against the shover-type posterior. */
+        function renderAllIn(a, ctx, fmt, bb) {
+            const x = a.allin;
+            const { kept, text: label } = keptLabel(ctx, x.heroAllIn ? 'All-in decision · a call puts you all-in' : 'All-in decision · facing a shove');
+            const verdict = x.verdict === 'close' ? 'CLOSE: EITHER' : x.verdict === 'call' ? (x.heroAllIn ? 'CALL ALL-IN' : `CALL ${fmt(x.callAmt)}`) : 'FOLD';
+            cverdict.textContent = kept ? '' : `${verdict} · ${signedBb(x.ev / bb).replace(/\s*bb$/, '')}`;
+            const kind = x.verdict === 'close' ? 'marginal' : x.verdict;
+            const why = x.readRisk
+                ? `Calling gains ${signedBb(x.ev / bb)} on this read but loses ${signedBb(-x.evCautious / bb).replace('+', '')} on a cautious one: your stack would ride on a thin read. Either is defensible.`
+                : x.verdict === 'close'
+                ? `Calling scores ${signedBb(x.ev / bb)} ±${(x.se / bb).toFixed(1)}: inside ${Math.abs(x.ev) < 0.5 * bb ? 'half a big blind' : 'the noise'}. Either is fine.`
+                : x.verdict === 'call' ? `Calling gains ${signedBb(x.ev / bb)} on average over folding${x.heroAllIn ? ` (your last ${fmt(x.callAmt)} goes in)` : ''}.` : `Calling loses ${signedBb(-x.ev / bb).replace('+', '')} on average; folding costs nothing more.`;
+            /* The verdict states its confidence (plan M1): does it hold whatever the player is, or only on the read? */
+            const t = x.threshold;
+            const o = x.opponents.find((y) => y.name === x.main) || x.opponents[0];
+            const readPct = (p) => (p > 0.99 ? '> 99%' : pctText(p));
+            const cautious = x.p >= o.prior ? x.pLow : x.pHigh;
+            const band = readPct(x.p) === readPct(cautious) ? readPct(x.p) : `${readPct(x.p)}, ${readPct(cautious)} on a cautious read`;
+            const sure = t.kind === 'at'
+                ? `Depends on the read: right if the chance ${x.main} shoves for fun is ${t.rising ? 'at least' : 'at most'} ${pctText(t.p)}; now ${band} (${o.hands ? `${o.hands} hand${o.hands === 1 ? '' : 's'} seen` : 'no hands seen'}).`
+                : t.kind === 'always' ? `Holds whether ${x.main} shoves for fun or for value.` : `Wrong to call whether ${x.main} shoves for fun or for value.`;
+            const behind = x.behind.length ? `${x.behind.length} still to act, priced as folding.` : null;
+            body.appendChild(el('div', { class: 'verdict ' + kind + (kept ? ' kept' : '') }, [
+                el('div', { class: 'lbl', text: label }),
+                el('div', { class: 'act', text: verdict }),
+                el('div', { class: 'alt', text: why }),
+                el('div', { class: 'sure', text: sure }),
+                behind ? el('div', { class: 'sure warn', text: behind }) : null,
+                el('div', { class: 'evline' }, [el('span', {}, ['Call EV ', el('b', { class: 'num', text: signedBb(x.ev / bb) }), el('span', { class: 'dim', text: ' ±' + (x.se / bb).toFixed(1) })]),
+                    el('span', { class: 'dim num', text: signedMoney(x.ev) })]),
+            ]));
+            madeLine(a.made);
+            const eqPct = x.equity * 100;
+            body.appendChild(el('div', { class: 'eqwrap' }, [
+                el('div', { class: 'lbls' }, [
+                    el('span', {}, ['Equity ', el('b', { class: 'num', text: eqPct.toFixed(1) + '%' }), el('span', { class: 'dim', text: ` vs ${x.main}'s shove range (${readPct(x.p)} for-fun mix)` })]),
+                    el('span', { class: 'dim', text: `need ${pctText(x.need, 1)} of ${fmt(x.winnable)}` }),
+                ]),
+                el('div', { class: 'eqbar' }, [el('i', { style: { width: Math.min(100, eqPct) + '%' } }), el('b', { style: { left: Math.min(100, x.need * 100) + '%' } })]),
+            ]));
+            const pNow = readPct(x.p);
+            const evidence = o.hands ? `${o.hands} hands seen, ${o.shoves} shove${o.shoves === 1 ? '' : 's'}${o.shown ? `, ${o.junk} of ${o.shown} shown were junk` : ''}` : `no hands on ${x.main} yet: the stake's prior (${pctText(o.prior)})`;
+            const rule = t.kind === 'always' ? 'Calling gains against a for-fun shover and a value shover alike.'
+                : t.kind === 'never' ? 'Calling loses against a for-fun shover and a value shover alike.'
+                : t.rising ? `Call if the chance ${x.main} is a for-fun shover is ${pctText(t.p)} or more.` : `Call if the chance ${x.main} is a for-fun shover is ${pctText(t.p)} or less.`;
+            body.appendChild(el('div', { class: 'box learn-only' }, [
+                el('h3', { text: `Is ${x.main} shoving for fun? Now ${pNow}` }),
+                el('div', { style: { fontSize: '12px' }, text: rule }),
+                el('div', { class: 'range', text: evidence }),
+            ]));
+            body.appendChild(el('div', { class: 'box learn-only' }, [
+                el('h3', { text: 'The money' }),
+                el('div', { style: { fontSize: '12px' }, text: `Against any two cards (a for-fun shover): call ${signedBb(x.evS / bb)}.` }),
+                el('div', { style: { fontSize: '12px', marginTop: '4px' }, text: `Against a value shover (${x.depth === 'deep' ? 'QQ+/AK' : x.depth === 'mid' ? 'TT+/AQ+/KQs' : 'the top 15%'}, plus 15% junk): call ${signedBb(x.evN / bb)}.` }),
+                el('div', { class: 'range', text: `Mixed at ${pNow}: ${signedBb(x.ev / bb)}. Side pots are paid separately; ${x.opponents.length > 1 ? 'other players in the pot hold their own mix.' : 'heads-up.'}` }),
+            ]));
+            for (const w of x.warnings.concat(a.warnings || [])) body.appendChild(el('div', { class: 'note-warn learn-only', text: w }));
+            selfNote(ctx);
+            footer(a, `${Math.round(x.samples / 1000)}k samples × 2`);
+            applyMode();
+        }
+
+        /* Everything that is not an all-in: exact prices, no verdict (0.7 scope; the 0.6 engine is a setting). */
+        function renderPrices(a, ctx, fmt, bb) {
+            const p = a.price;
+            const { kept, text: label } = keptLabel(ctx, 'Prices · no verdict outside all-ins');
+            cverdict.textContent = kept || !(p.toCall > 0) ? '' : `Need ${pctText(p.need, 1)} · ${fmt(p.callAmt)}`;
+            body.appendChild(el('div', { class: 'verdict prices' + (kept ? ' kept' : '') }, [
+                el('div', { class: 'lbl', text: label }),
+                el('div', { class: 'act', text: p.toCall > 0 ? `Need ${pctText(p.need, 1)} to call ${fmt(p.callAmt)}` : 'Nothing to call' }),
+                el('div', { class: 'alt', text: p.toCall > 0 ? `You can win ${fmt(p.winnable)}. Your call breaks even at ${pctText(p.need, 1)} equity; the decision is yours.` : `Pot ${fmt(p.pot)}. Checking is free; the decision is yours.` }),
+            ]));
+            madeLine(a.made);
+            const facts = [`Pot ${fmt(p.pot)}`];
+            if (p.toCall > 0 && Math.abs(p.winnable - p.pot - p.callAmt) > 0.5) facts.push(`winnable ${fmt(p.winnable)} (the rest is beyond your stack)`);
+            if (p.spr !== null) facts.push(`stack-to-pot ${p.spr.toFixed(1)}`);
+            body.appendChild(el('div', { class: 'range', style: { marginTop: '0' }, text: facts.join(' · ') }));
+            if (a.shove) {
+                const sh = a.shove;
+                body.appendChild(el('div', { class: 'box' }, [
+                    el('h3', { text: `All-in price (${sh.effBB.toFixed(0)} bb effective)` }),
+                    el('div', { style: { fontSize: '12px' }, text: sh.breakEven <= 0
+                        ? `If ${sh.caller} calls with a value range you still have ${pctText(sh.equity)}: the shove gains even when called.`
+                        : `If ${sh.caller} calls with a value range you have ${pctText(sh.equity)}. The shove breaks even if everyone folds ${pctText(sh.breakEven)} of the time.` }),
+                    el('div', { class: 'range', text: 'A price, not advice: 0.7 has no fold model it trusts yet.' }),
+                ]));
+            }
+            if (a.chart) body.appendChild(el('div', { class: 'range learn-only', text: `${a.chart.label}: ${a.chart.action} (${a.chart.freq}% of the time).` }));
+            for (const w of a.warnings || []) body.appendChild(el('div', { class: 'note-warn', text: w }));
+            selfNote(ctx);
+            body.appendChild(el('div', { class: 'dim learn-only', style: { fontSize: '12px' }, text: 'Verdicts only for all-in calls for now. Legacy advice for the rest: Settings › Advice.' }));
+            footer(a, '');
             applyMode();
         }
 
@@ -4307,12 +5167,35 @@
              *  - Results/Settings/Calibration keep their size, and on your turn also end above the buttons.
              * The title bar always stays clickable. Re-measured only when something moved (review B8).
              */
+            /*
+             * Where nobody has dragged the panel, keep it off the table itself (plan M1: never over seats, names or stacks).
+             * At half width the default right-hand spot lands on the table; below the table is free, so it goes there.
+             */
+            avoidTable(rect) {
+                const k = [rect && [rect.left, rect.top, rect.right, rect.bottom].map(Math.round).join(','), view, window.innerWidth, window.innerHeight, !!getSettings().panelPos].join('|');
+                if (k === avoidKey) return;
+                avoidKey = k;
+                if (view !== 'table' || getSettings().panelPos) return;
+                box.style.top = '';
+                baseMax = '';
+                box.style.maxHeight = '';
+                clearKey = '';
+                if (!rect) return;
+                const b = box.getBoundingClientRect();
+                if (!(b.left < rect.right && b.right > rect.left && b.top < rect.bottom && b.bottom > rect.top)) return;
+                const room = window.innerHeight - rect.bottom - 16;
+                if (room >= 200) {
+                    box.style.top = Math.round(rect.bottom + 8) + 'px';
+                    baseMax = room + 'px';
+                    box.style.maxHeight = baseMax;
+                }
+            },
             keepClear(area) {
                 const k = [area && [area.left, area.top, area.right, area.bottom].map(Math.round).join(','), view, heroTurn, box.style.left, box.style.top,
-                    window.innerWidth, window.innerHeight, body.childElementCount, getSettings().collapsed].join('|');
+                    window.innerWidth, window.innerHeight, body.childElementCount, getSettings().collapsed, baseMax].join('|');
                 if (k === clearKey) return;
                 clearKey = k;
-                box.style.maxHeight = '';
+                box.style.maxHeight = baseMax;
                 box.classList.remove('passthru');
                 if (!area) return;
                 const r = box.getBoundingClientRect();
@@ -4381,6 +5264,62 @@
         return `${word} ${fc.lossBB ? `after −${fc.lossBB} bb` : 'lately'}\nlast ${fc.n}h ${pct(fc.recent)} · usual ${pct(fc.life)}`;
     }
 
+    const TILE_H1 = 26;
+    const TILE_H2 = 42;
+    const rectHit = (a, b) => a.left < b.right && a.left + a.w > b.left && a.top < b.bottom && a.top + a.h > b.top;
+    const rectOverlap = (a, b) => Math.max(0, Math.min(a.left + a.w, b.right) - Math.max(a.left, b.left)) * Math.max(0, Math.min(a.top + a.h, b.bottom) - Math.max(a.top, b.top));
+
+    /*
+     * Under its seat, or flipped above it; never over Torn's controls or any seat (names, stacks, cards: plan M1,
+     * session 6 had tiles over both). Among the safe spots, the one overlapping other tiles least. No safe spot:
+     * the tile is not drawn. obstacles = every seat's rect, controls = the rect around Torn's buttons.
+     */
+    function placeTiles(items, settings, obstacles = [], controls = null, vw = window.innerWidth, vh = window.innerHeight) {
+        const out = new Map();
+        const taken = [];
+        for (const it of items) {
+            if (!it.rect || it.rect.width === 0) continue;
+            const w = it.hot && settings.tileHot ? 172 : 132;
+            const h = it.lines > 1 ? TILE_H2 : TILE_H1;
+            const left = Math.max(4, Math.min(vw - w - 4, it.rect.left + it.rect.width / 2 - w / 2));
+            const own = (o) => o.left === it.rect.left && o.top === it.rect.top && o.right === it.rect.right;
+            const spots = [
+                { left, top: it.rect.bottom + 4, w, h, flipped: false },
+                { left, top: it.rect.top - h - 4, w, h, flipped: true },
+            ].filter((c) => c.top >= 4 && c.top + c.h <= vh - 4);
+            let best = null;
+            let bestCost = Infinity;
+            for (const c of spots) {
+                if (controls && rectHit(c, controls)) continue;
+                if (obstacles.some((o) => !own(o) && rectOverlap(c, o) > 0)) continue;
+                let cost = 0;
+                for (const t of taken) cost += rectOverlap(c, { left: t.left, top: t.top, right: t.left + t.w, bottom: t.top + t.h });
+                if (cost < bestCost) [best, bestCost] = [c, cost];
+                if (cost === 0) break;
+            }
+            if (!best) continue;
+            taken.push(best);
+            out.set(it.key, { left: Math.round(best.left), top: Math.round(best.top), flipped: best.flipped });
+        }
+        return out;
+    }
+
+    /* At most two text lines: who they are, then the one thing that matters most right now. */
+    function secondLine(it, settings) {
+        /* The shover read outranks everything: it is the one read 0.7 prices a call with. */
+        if (it.shover !== null && it.shover !== undefined && it.shover >= 0.3 && !it.folded) return { text: `For-fun shover? ${Math.round(it.shover * 100)}%`, warn: true };
+        if (it.hot && settings.tileHot) {
+            if (it.folded) return { text: 'Range now: folded' };
+            if (it.rangePct !== null && it.rangePct !== undefined) {
+                const pct = it.rangePct < 0.005 ? '< 1%' : '≈ ' + Math.round(it.rangePct * 100) + '%';
+                return { text: `Range ${pct}` + (it.read ? ` · ${it.read}` : '') };
+            }
+            if (it.read) return { text: it.read };
+        }
+        if (it.note && settings.tileForm) return { text: it.note.split('\n')[0], warn: true };
+        return null;
+    }
+
     function createTiles(layer) {
         const tiles = new Map();
         const bubble = el('div', { class: 'minibub hidden' });
@@ -4396,62 +5335,35 @@
             return t;
         }
 
-        /**
-         * items: [{ key, rect, folded, hot, type: {type,label,hands,vpip,pfr}, conf, rangePct, read, note }]
-         */
-        /* Where each tile goes: under its seat, inside the window, nudged down past a tile it would overlap (review U11). */
-        function place(items, settings) {
-            const out = new Map();
-            const taken = [];
-            for (const it of items) {
-                if (!it.rect || it.rect.width === 0) continue;
-                const w = it.hot && settings.tileHot ? 172 : 132;
-                const left = Math.max(4, Math.min(window.innerWidth - w - 4, it.rect.left + it.rect.width / 2 - w / 2));
-                let top = Math.min(window.innerHeight - 40, it.rect.bottom + 4);
-                for (const o of taken) if (left < o.left + o.w && left + w > o.left && Math.abs(top - o.top) < 44) top = o.top + 46;
-                taken.push({ left, top, w });
-                out.set(it.key, { left: Math.round(left), top: Math.round(top) });
-            }
-            return out;
-        }
-
-        function update(items, settings) {
+        /* items: [{ key, rect, folded, hot, type: {type,label,hands,vpip,pfr}, conf, rangePct, read, note, shover }] */
+        function update(items, settings, obstacles = [], controls = null) {
             const seen = new Set();
-            const spots = place(items, settings);
+            for (const it of items) it.lines = secondLine(it, settings) ? 2 : 1;
+            const spots = placeTiles(items, settings, obstacles, controls);
             if (settings.tiles) {
                 for (const it of items) {
                     if (!it.rect || it.rect.width === 0) continue;
                     if (it.folded && settings.folded === 'hide') continue;
+                    const spot = spots.get(it.key);
+                    if (!spot) continue;
                     seen.add(it.key);
                     const t = tileFor(it.key);
-                    const spot = spots.get(it.key);
                     const pos = spot.left + ',' + spot.top;
+                    const line2 = secondLine(it, settings);
                     const sig = JSON.stringify([pos, it.folded, it.hot, it.type && [it.type.type, it.type.label, Math.round(it.type.vpip * 100), Math.round(it.type.pfr * 100), it.type.hands],
-                        Math.round((it.conf || 0) * 100), it.rangePct, it.read, it.note, it.noteDir,
+                        Math.round((it.conf || 0) * 100), line2, it.noteDir,
                         settings.tileType, settings.tileStats, settings.tileConf, settings.tileHot, settings.tileForm, settings.folded]);
                     if (t.dataset.sig === sig) continue;
                     t.dataset.sig = sig;
                     clear(t);
                     t.className = 'tile' + (it.hot && settings.tileHot ? ' hot' : '') + (it.folded && settings.folded === 'fade' ? ' faded' : '');
-                    const top = el('div', { class: 't' }, [
+                    t.appendChild(el('div', { class: 't' }, [
                         settings.tileType && it.type ? el('span', { class: 'pill ' + it.type.type, text: it.type.label }) : el('span'),
                         /* "7h" reads as 7 hours, not 7 hands (live report 2026-09-27): n= is unambiguous at any sample size. */
                         settings.tileStats && it.type && it.type.hands ? el('span', { class: 'num', text: `${Math.round(it.type.vpip * 100)}${it.noteDir && settings.tileForm ? (it.noteDir === 'up' ? '↑' : '↓') : ''}/${Math.round(it.type.pfr * 100)} · n=${it.type.hands}` }) : el('span', { class: 'dim', text: it.type && it.type.hands ? '' : 'no hands yet' }),
-                    ]);
-                    t.appendChild(top);
+                    ]));
+                    if (line2) t.appendChild(el('div', { class: 'l2' + (line2.warn ? ' warn' : ''), text: line2.text }));
                     if (settings.tileConf) t.appendChild(el('div', { class: 'conf', title: 'How sure the read is' }, [el('i', { style: { width: Math.round((it.conf || 0) * 100) + '%' } })]));
-                    if (it.hot && settings.tileHot) {
-                        /* A folded player has no live range to size (live report 2026-09-27: "≈ 0%" reads as a
-                           measurement, not as "they're out of the hand"). */
-                        if (it.folded) {
-                            t.appendChild(el('div', { class: 't' }, [el('span', { text: 'Range now' }), el('span', { class: 'dim', text: 'folded' })]));
-                        } else if (it.rangePct !== null && it.rangePct !== undefined) {
-                            t.appendChild(el('div', { class: 't' }, [el('span', { text: 'Range now' }), el('span', { class: 'num', text: it.rangePct < 0.005 ? '< 1%' : '≈ ' + Math.round(it.rangePct * 100) + '%' })]));
-                            t.appendChild(el('div', { class: 'rbar' }, [el('i', { style: { width: Math.round(it.rangePct * 100) + '%' } })]));
-                        }
-                        if (it.read) t.appendChild(el('div', { class: 'rd', text: it.read }));
-                    }
-                    if (it.note && settings.tileForm) t.appendChild(el('div', { class: 'fm', text: it.note }));
                     t.style.left = spot.left + 'px';
                     t.style.top = spot.top + 'px';
                 }
@@ -4578,6 +5490,81 @@
         return !!adviceFor && !!hand && adviceFor.gameId === hand.gameId;
     }
 
+    /* ===== src/ui/latency.js ===== */
+    /*
+     * Latency instrumentation (plan M1; the gates are G9 in M11): how long a page read, a log line and
+     * a decision take, and the browser's long tasks (> 50 ms). Kept in memory, shown in Calibration and
+     * written into each journaled decision.
+     */
+
+    const KEEP = 500;
+
+    function ring() {
+        const xs = [];
+        return {
+            push(x) {
+                if (!Number.isFinite(x)) return;
+                xs.push(x);
+                if (xs.length > KEEP) xs.shift();
+            },
+            stats() {
+                if (!xs.length) return null;
+                const s = [...xs].sort((a, b) => a - b);
+                const q = (f) => s[Math.min(s.length - 1, Math.floor(f * s.length))];
+                return { n: s.length, p50: q(0.5), p95: q(0.95), max: s[s.length - 1] };
+            },
+        };
+    }
+
+    function createLatency() {
+        const ticks = ring();
+        const rows = ring();
+        const decisions = ring();
+        const turns = ring();
+        let longCount = 0;
+        let longMax = 0;
+        let sinceCount = 0;
+        let sinceMax = 0;
+        let observing = false;
+        try {
+            if (typeof PerformanceObserver === 'function' && (PerformanceObserver.supportedEntryTypes || []).includes('longtask')) {
+                new PerformanceObserver((list) => {
+                    for (const e of list.getEntries()) {
+                        longCount++;
+                        sinceCount++;
+                        longMax = Math.max(longMax, e.duration);
+                        sinceMax = Math.max(sinceMax, e.duration);
+                    }
+                }).observe({ type: 'longtask' });
+                observing = true;
+            }
+        } catch {
+            observing = false;
+        }
+        const r1 = (x) => (Number.isFinite(x) ? Math.round(x * 10) / 10 : null);
+        return {
+            /* The gate paused: long tasks from here on belong to no decision. */
+            pause() {
+                sinceCount = 0;
+                sinceMax = 0;
+            },
+            tick: (ms) => ticks.push(ms),
+            row: (ms) => rows.push(ms),
+            /** Record one decision; returns what goes into the journal entry. */
+            decision({ computeMs, renderMs, turnMs }) {
+                decisions.push(computeMs + renderMs);
+                if (turnMs !== null) turns.push(turnMs);
+                const out = { computeMs: r1(computeMs), renderMs: r1(renderMs), turnMs: r1(turnMs), longTasks: observing ? sinceCount : null, longMaxMs: observing ? r1(sinceMax) : null };
+                sinceCount = 0;
+                sinceMax = 0;
+                return out;
+            },
+            summary() {
+                return { tick: ticks.stats(), row: rows.stats(), decision: decisions.stats(), turn: turns.stats(), longTasks: observing ? longCount : null, longMaxMs: observing ? r1(longMax) : null };
+            },
+        };
+    }
+
     /* ===== src/main.js ===== */
     /*
      * Wiring. Reads the page only while the safety gate is open, feeds the log
@@ -4608,7 +5595,12 @@
 
 
 
+
+
     const TICK_MS = 700;
+    /* Bump when stats.js counts differently: stored players are rebuilt from the raw hands once (0.7: AFq with checks,
+       shv/shvj per stake). */
+    const STATS_SCHEMA = 2;
 
     function strongestRead(store, bb) {
         if (!store || store.hands < 8) return null;
@@ -4668,10 +5660,19 @@
         let adviceFor = null;
         let pending = null;
         let adviseTimer = null;
+        let precomputeTimer = null;
         const recent = [];
         const unknown = [];
 
         const tracker = createTracker({ onHandComplete });
+        const latency = createLatency();
+        /* Seat timers (HandRecord v2 tTurn): when each player's turn was first seen, and who must be seen idle again first. */
+        const turnStart = new Map();
+        const turnDone = new Set();
+        let lastRowAt = 0;
+        let turnSeenAt = null;
+        /* Only the first advice of a turn measures "your turn -> advice"; later refreshes in the same turn do not. */
+        let turnFresh = false;
         const advisor = createAdvisor({ getPlayer: (k) => players[k] || null });
         const logdiff = createLogDiff();
 
@@ -4688,7 +5689,9 @@
                 const hands = await idbGetAll('hands').catch(() => []);
                 const decisions = await idbGetAll('decisions').catch(() => []);
                 if (!hands.length) return null;
-                const lines = hands.map((h) => JSON.stringify(h)).concat(decisions.map((d) => JSON.stringify({ kind: 'decision', ...d })));
+                /* Export v2: a meta line first (import skips it; v1 files have none). */
+                const meta = { kind: 'meta', format: 'torn-tablemind', v: 2, version, exported: Date.now(), hands: hands.length, decisions: decisions.length };
+                const lines = [JSON.stringify(meta)].concat(hands.map((h) => JSON.stringify(h)), decisions.map((d) => JSON.stringify({ kind: 'decision', ...d })));
                 const blob = new Blob([lines.join('\n') + '\n'], { type: 'application/x-ndjson' });
                 gmSet('lastExport', { t: Date.now(), hands: hands.length });
                 return { url: freshBlobUrl('export', blob), name: `tablemind-hands-${new Date().toISOString().slice(0, 10)}.jsonl`, count: hands.length };
@@ -4715,6 +5718,7 @@
                             invalid++;
                             continue;
                         }
+                        if (o && o.kind === 'meta') continue;
                         if (o && o.kind === 'decision') {
                             if (validDecision(o)) dec.push((({ kind, ...rest }) => rest)(o));
                             else invalid++;
@@ -4794,7 +5798,7 @@
                     dealer: s ? s.dealer : null, board: s && s.board.length ? cardsToString(s.board) : '', pot: s ? s.pot : null,
                     units: s ? s.units : null, actions: s && s.actions.length ? s.actions.map((a) => a.label).join(' | ') : '',
                     logRows: readLogRows().length, hand: h ? `${h.gameId || 'partial'} · ${h.street} · ${h.actions.length} actions${h.warnings.length ? ' · ' + h.warnings.join('; ') : ''}` : null,
-                    tablesVersion: tables().manifest.tablesVersion, recent: recent.slice(-30), unknown: unknown.slice(-20),
+                    tablesVersion: tables().manifest.tablesVersion, recent: recent.slice(-30), unknown: unknown.slice(-20), latency: latency.summary(),
                 };
             },
             saveSnapshot() {
@@ -4817,10 +5821,14 @@
         panel.setStatus(false, 'Paused', '');
         panel.renderAdvice({ blocked: ["Click the table or press any key to start. TableMind only reads while you're using this page"] }, null);
 
-        idbGetAll('players').then((list) => list.forEach((p) => {
-            const cur = players[p.key];
-            if (!cur || (p.hands || 0) > (cur.hands || 0)) players[p.key] = p;
-        })).catch(() => {});
+        if (gmGet('statsSchema', 1) !== STATS_SCHEMA) {
+            actions.rebuildStats().then(() => gmSet('statsSchema', STATS_SCHEMA)).catch(() => {});
+        } else {
+            idbGetAll('players').then((list) => list.forEach((p) => {
+                const cur = players[p.key];
+                if (!cur || (p.hands || 0) > (cur.hands || 0)) players[p.key] = p;
+            })).catch(() => {});
+        }
         idbCount('hands').then((n) => {
             handCount = n;
             updateReminder();
@@ -4829,8 +5837,15 @@
         function onHandComplete(rec) {
             const seated = !!rec.hero && rec.hero in (rec.net || {});
             if ((seated && !settings.recordSeated) || (!seated && !settings.recordWatched)) return;
+            /* A decision is journaled only with what hero did (session 6: a phantom entry after a fold had no `taken`).
+               Hero's action and the settle can land in the same read: take it from the finished record then. */
             if (pending && pending.gameId === rec.gameId) {
-                idbPut('decisions', pending).catch(() => {});
+                const took = rec.actions.slice(pending.i).find((a) => a.who === pending.hero);
+                if (took) {
+                    pending.taken = { type: took.type, toAmount: took.toAmount, allin: !!took.allin };
+                    pending.followed = sameAction(pending.advice.best, pending.taken);
+                    idbPut('decisions', pending).catch(() => {});
+                }
                 pending = null;
             }
             /* A partial hand (joined mid-hand, log scrolled) cannot be settled: keep nothing (review B6). */
@@ -4885,6 +5900,16 @@
             return [hand.gameId, hand.actions.length, hand.street, heroActingNow, s.heroCards && s.heroCards.join(), s.toCallLabel, s.pot, s.board.join(), settings.samples, settings.exploit].join('|');
         }
 
+        function slimAllIn(advice) {
+            const a = advice.allin;
+            const call = { id: 'call', label: 'Call', to: null, amount: a.callAmt, ev: a.ev, se: a.se, pAllFold: null, eqCont: a.equity };
+            const fold = { id: 'fold', label: 'Fold', to: null, amount: null, ev: 0, se: 0, pAllFold: null, eqCont: null };
+            return {
+                best: a.verdict === 'call' ? call : a.verdict === 'fold' ? fold : a.ev >= 0 ? call : fold, actions: [fold, call], marginal: a.verdict === 'close',
+                equity: a.equity, need: a.need, mode: 'allin', verdict: a.verdict, p: a.p, main: a.main, evS: a.evS, evN: a.evN, threshold: a.threshold, depth: a.depth,
+            };
+        }
+
         function slim(advice) {
             /* Fold and called-equity terms too, so a session's bluffs and value bets can be audited offline. */
             const pick = (x) => x && { id: x.id, label: x.label, to: x.to ?? null, amount: x.amount ?? null, ev: x.ev, se: x.se, pAllFold: x.pAllFold ?? null, eqCont: x.eqCont ?? null };
@@ -4909,11 +5934,13 @@
             clearTimeout(adviseTimer);
             adviseTimer = setTimeout(() => {
                 let result;
+                const t0 = performance.now();
                 try {
                     result = advisor.advise(hand, s, settings);
                 } catch (e) {
                     result = { blocked: ['Could not compute advice: ' + e.message] };
                 }
+                const computeMs = performance.now() - t0;
                 lastAdvice = result;
                 const heroStore = s && s.hero ? players[playerKey(s.hero)] || null : null;
                 const ctx = {
@@ -4922,10 +5949,15 @@
                 };
                 lastCtx = ctx;
                 panel.renderAdvice(result, ctx);
-                if (result.advice && hand) {
+                const done = performance.now();
+                const lat = latency.decision({ computeMs, renderMs: done - t0 - computeMs, turnMs: turnFresh && turnSeenAt !== null ? done - turnSeenAt : null });
+                turnFresh = false;
+                const mode = result.advice && result.advice.mode;
+                if (hand && (mode === 'allin' || mode === 'legacy')) {
                     pending = {
                         id: `${hand.gameId}#${hand.actions.length}`, gameId: hand.gameId, i: hand.actions.length, street: hand.street, bb: hand.bb,
-                        advice: slim(result.advice), villainType: result.advice.mainType ? result.advice.mainType.label : null, hero: heroName, t: Date.now(),
+                        advice: mode === 'allin' ? slimAllIn(result.advice) : { ...slim(result.advice), mode: 'legacy' },
+                        villainType: result.advice.mainType ? result.advice.mainType.label : null, hero: heroName, t: Date.now(), v: 2, lat,
                     };
                 }
             }, 0);
@@ -4945,7 +5977,7 @@
             }
         }
 
-        function updateTiles(s, hand) {
+        function updateTiles(s, hand, root = findTableRoot()) {
             const bb = hand ? hand.bb : 0;
             const lastAgg = hand ? hand.streetAggressor || (hand.street === 'preflop' ? hand.aggressor : null) : null;
             const items = [];
@@ -4960,15 +5992,17 @@
                     conf: confidenceOf(store ? store.hands : 0, 10),
                     rangePct: range ? rangeSummary(range, [...(s.heroCards || []), ...s.board]).fraction : null,
                     read: hot ? strongestRead(store, bb) : null,
+                    shover: store && store.stats && store.stats['shv:' + bb] ? shoverPosterior(store, bb).p : null,
                     ...(() => {
                         const fc = settings.tileForm ? formChange(store, 'vpip', bb) : null;
                         return { note: formText(fc), noteDir: fc ? fc.dir : null };
                     })(),
                 });
             }
-            tiles.update(panel.view === 'table' ? items : [], settings);
+            const obstacles = s.seats.filter((x) => !x.empty && x.rect && x.rect.width).map((x) => x.rect);
+            tiles.update(panel.view === 'table' ? items : [], settings, obstacles, root ? readActionArea(root) : null);
             const adv = lastAdvice && lastAdvice.advice;
-            tiles.showBubble(settings.collapsed && settings.collapsedBubble && adv && s.hero ? verdictText(adv.best, settings.units, bb) : null, s.hero ? s.hero.rect : null);
+            tiles.showBubble(settings.collapsed && settings.collapsedBubble && adv && s.hero ? shortVerdict(adv, settings.units, bb) || null : null, s.hero ? s.hero.rect : null);
         }
 
         function tick() {
@@ -4985,10 +6019,15 @@
                 if (wasOpen) {
                     /* A queued advice must not land on the paused panel. */
                     clearTimeout(adviseTimer);
+                    clearTimeout(precomputeTimer);
                     recent.push(`[paused] ${gate.reasons.join('; ')}`);
                     tracker.finish();
                     logdiff.reset();
                     tiles.clearAll();
+                    turnStart.clear();
+                    turnDone.clear();
+                    turnSeenAt = null;
+                    latency.pause();
                     lastKey = '';
                 }
                 panel.setTurn(false);
@@ -4999,7 +6038,11 @@
                 }
                 return;
             }
-            if (!wasOpen) recent.push('[reading] gate open');
+            if (!wasOpen) {
+                recent.push('[reading] gate open');
+                latency.pause();
+            }
+            const tickStart = performance.now();
             snap = readTable(root, { overlayHost: host });
             const rows = readLogRows();
             if (snap.hero && !snap.hero.name) {
@@ -5007,9 +6050,12 @@
                 const mine = [...rows].reverse().find((r) => r.current && r.actor);
                 snap.hero.name = (mine && mine.actor) || settings.username || null;
             }
-            for (const row of logdiff.next(rows)) {
+            const fresh = logdiff.next(rows);
+            const vis = document.visibilityState === 'hidden' ? 'hidden' : 'visible';
+            for (const row of fresh) {
                 /* A new action of your own at the table counts as being present. */
                 if (row.current) lastInputAt = Math.max(lastInputAt || 0, now);
+                const rowStart = performance.now();
                 const ev = parseLogRow(row);
                 recent.push(`${row.actor} | ${row.text}  →  ${ev.kind}${ev.type ? ':' + ev.type : ''}`);
                 if (recent.length > 60) recent.shift();
@@ -5017,7 +6063,25 @@
                     unknown.push(`${row.actor} | ${row.text}`);
                     if (unknown.length > 40) unknown.shift();
                 }
-                tracker.feed(ev, now);
+                if (ev.kind === 'start') {
+                    turnStart.clear();
+                    turnDone.clear();
+                }
+                /* A repaint burst: several lines in one read, or one within 100 ms of the last (plan M1 `batch`). */
+                const meta = { tSeen: now, tTurn: null, batch: fresh.length > 1 || now - lastRowAt < 100, live: !fresh.replay, vis };
+                if (ev.kind === 'act' && ev.who) {
+                    meta.tTurn = turnStart.get(ev.who) ?? null;
+                    turnStart.delete(ev.who);
+                    turnDone.add(ev.who);
+                }
+                tracker.feed(ev, now, meta);
+                latency.row(performance.now() - rowStart);
+            }
+            if (fresh.length) lastRowAt = now;
+            for (const seat of snap.seats) {
+                if (!seat.name || seat.empty) continue;
+                if (!seat.active) turnDone.delete(seat.name);
+                else if (!turnDone.has(seat.name) && !turnStart.has(seat.name)) turnStart.set(seat.name, now);
             }
             tracker.setSeats(snap.seats.filter((x) => !x.empty).map(({ index, xid, name, stack }) => ({ index, xid, name, stack })), snap.dealer);
             const heroName = (snap.hero && snap.hero.name) || null;
@@ -5037,11 +6101,29 @@
                2026-09-27: a race gave "RAISE TO $675,000" on top of hero's own raise). Until a later
                action or a new street shows up, don't trust the DOM's heroTurn. */
             const heroActingNow = snap.heroTurn && !heroActedLastOnStreet(hand, heroName);
+            if (heroActingNow && turnSeenAt === null) {
+                turnSeenAt = performance.now();
+                turnFresh = true;
+            } else if (!heroActingNow) turnSeenAt = null;
+            /* An all-in on the log: work out hero's verdict now, in its own task, so hero's turn is a lookup. */
+            if (fresh.length && hand && heroName && !heroActingNow && snap.heroCards && hand.actions.some((a) => a.allin)) {
+                clearTimeout(precomputeTimer);
+                const s = snap;
+                precomputeTimer = setTimeout(() => {
+                    if (!gate.open) return;
+                    try {
+                        advisor.advise(hand, s, settings, { precompute: true });
+                    } catch {
+                        /* The turn computes it again and shows any error. */
+                    }
+                }, 0);
+            }
 
             const bb = hand && hand.bb ? hand.bb : 0;
             const tableText = bb && snap.units !== 'bb' && hand.unit !== 'bb' ? `$${(bb / 2).toLocaleString('en-US')}/$${bb.toLocaleString('en-US')}` : '';
             const turn = heroActingNow ? 'Your turn' : snap.hero ? 'Seated' : 'Watching';
             panel.setTurn(heroActingNow);
+            panel.avoidTable(root.getBoundingClientRect());
             panel.keepClear(readActionArea(root));
             panel.setStatus(true, `${turn} · ${hand ? hand.street[0].toUpperCase() + hand.street.slice(1) : 'between hands'}`, tableText);
 
@@ -5051,7 +6133,8 @@
                 if (heroActingNow || !lastAdvice || lastAdvice.blocked) runAdvice(hand, snap, heroName);
                 else renderKept(hand);
             }
-            updateTiles(snap, hand);
+            updateTiles(snap, hand, root);
+            latency.tick(performance.now() - tickStart);
         }
 
         setInterval(tick, TICK_MS);
@@ -5076,7 +6159,8 @@
         window.addEventListener('resize', () => {
             /* A panel dragged near an edge must not be left off-screen when the window shrinks (live report 2026-09-27). */
             panel.clampToViewport();
-            if (snap) updateTiles(snap, tracker.hand);
+            /* Paused means no reading at all, resize included (SAST 2026-09-28). */
+            if (snap && gate.open) updateTiles(snap, tracker.hand);
         }, { passive: true });
 
         gmMenu('TableMind: calibration', () => panel.show('calibration'));

@@ -1,7 +1,8 @@
 # Torn TableMind: a Hold'em advisor for Torn's poker table
 
-A Tampermonkey overlay for Torn's poker page. It reads the table you are looking at. On your turn it shows the best
-action and size, with the EV of every action. **It never clicks, types or sends anything: you make every move.**
+A Tampermonkey overlay for Torn's poker page. It reads the table you are looking at. When you face an all-in, it tells
+you whether calling gains, and why. Everywhere else it shows the exact price and your made hand, but no verdict yet.
+**It never clicks, types or sends anything: you make every move.**
 
 ## Install
 
@@ -16,11 +17,20 @@ Then open `https://www.torn.com/page.php?sid=holdem` and click once on the page.
 
 ## What it shows
 
-- **The exact price to call.** It comes from the game log and is checked against Torn's Call button, which rounds
-  amounts over $1k. The footer says "price matches Torn ✓" when both agree.
-- **Your equity against each opponent's estimated range.** The range updates with every action, bet size and board card.
-- **The EV of every legal action** (fold, call, each raise size, all-in) and the best one. When two options are
-  within the noise, it says so.
+- **All-in calls (a verdict):** CALL ALL-IN, FOLD or CLOSE: EITHER.
+  - The EV is worked out against what the shover is likely holding. That uses a model of for-fun shovers (any two cards)
+    versus value shovers, updated from each player's shoves and shown hands at this stake.
+  - It states the break-even point: "Call if the chance X is a for-fun shover is 64% or more. Now 90%."
+  - A call that only gains on a thin read shows as CLOSE: EITHER.
+- **Everywhere else, exact prices, no verdict:**
+  - "Need 28.6% to call $1,250", priced against the pot you can actually win;
+  - the stack-to-pot ratio;
+  - when you're short (≤ 25 bb), the fold rate your shove needs.
+
+  The price comes from the game log and is checked against Torn's Call button.
+- **Your made hand**, e.g. "Straight, 5-high (wheel)".
+- **The old 0.6 engine** is still in Settings › Advice as "legacy, unrated", off by default. It gives an action for every
+  spot, but it lost the raise wars at $500/$1k.
 - **A read tile under each player:** their type (Nit, TAG, Fish, Station, Maniac…), VPIP/PFR, how many hands it rests on,
   and how sure the read is.
   - Reads lean on each player's **recent form**. In 8.8 million play-money hands, a player's last ~25 hands predicted
@@ -58,6 +68,18 @@ Then open `https://www.torn.com/page.php?sid=holdem` and click once on the page.
 - If something looks wrong, open Settings › About › **Calibration**. It shows exactly what the script reads from the page.
 
 ## Version
+
+**0.7.0** "all-in advisor":
+- A verdict only where it can price the spot exactly: all-in calls. The all-in EV was checked against an independent
+  evaluator (pokerkit), and it matched exactly on every recorded all-in.
+- The verdict is ready the moment your turn starts: it is worked out when the shove appears in the log.
+- **Fixes:**
+  - no advice after you fold;
+  - "need %" against the pot you can win;
+  - tiles never cover Torn's buttons or seats;
+  - "< 1%" instead of "0% of hands";
+  - your starting stack after a bust or rebuy.
+- **Hand history:** it records timestamps and the stake. Older exports still import.
 
 **0.4.0** fixes the advice mistakes the first real-stakes session showed:
 - **No more bluff escalation into an all-in.** It no longer shoves weak hands into a player who just raised, and it
