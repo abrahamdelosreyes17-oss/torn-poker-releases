@@ -1,7 +1,8 @@
 # Torn TableMind: a Hold'em advisor for Torn's poker table
 
 A Tampermonkey overlay for Torn's poker page. It reads the table you are looking at. When you face an all-in, it tells
-you whether calling gains, and why. Everywhere else it shows the exact price and your made hand, but no verdict yet.
+you whether calling gains, and why. When you're short-stacked and first in, it tells you whether to shove or fold, from a
+solved chart. Everywhere else it shows the exact price and your made hand, but no verdict yet.
 **It never clicks, types or sends anything: you make every move.**
 
 ## Install
@@ -22,6 +23,13 @@ Then open `https://www.torn.com/page.php?sid=holdem` and click once on the page.
     versus value shovers, updated from each player's shoves and shown hands at this stake.
   - It states the break-even point: "Call if the chance X is a for-fun shover is 64% or more. Now 90%."
   - A call that only gains on a thin read shows as CLOSE: EITHER.
+- **Short stack, first in (a verdict):** PUSH ALL-IN, FOLD or CLOSE: LEAN PUSH/FOLD, for 2–9 players dealt in and up to
+  20 big blinds. It comes from a push/fold chart solved for each table size, checked against a public heads-up chart
+  with no disagreements. Facing one all-in with everyone between folding, the chart's call or fold sits beside the
+  all-in verdict.
+  - Not covered, and it says so: limps, raises that are not all-in, a caller before you, straddles and dead blinds.
+- **Learn mode explains in plain words:** every verdict has a short "why" with no poker-math jargon, and the same words
+  are saved with each decision in your hand history.
 - **Everywhere else, exact prices, no verdict:**
   - "Need 28.6% to call $1,250", priced against the pot you can actually win;
   - the stack-to-pot ratio;
@@ -68,6 +76,11 @@ Then open `https://www.torn.com/page.php?sid=holdem` and click once on the page.
 - If something looks wrong, open Settings › About › **Calibration**. It shows exactly what the script reads from the page.
 
 ## Version
+
+**0.7.1** "push/fold":
+- A push/fold chart for 2–9 players, 1–20 big blinds, solved offline (about 94 billion simulated deals). Heads-up it
+  matches HoldemResources' Nash chart on every hand that isn't a coin flip between the two actions.
+- Learn mode's "In plain words" box on every verdict; each decision in the journal keeps its why.
 
 **0.7.0** "all-in advisor":
 - A verdict only where it can price the spot exactly: all-in calls. The all-in EV was checked against an independent
